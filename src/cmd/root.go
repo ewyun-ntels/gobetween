@@ -47,7 +47,9 @@ var RootCmd = &cobra.Command{
 	Use:   "gobetween",
 	Short: "Modern & minimalistic load balancer for the Cloud era",
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
-		if pidFilePath != "" {
+		// Only the supervisor owns the pidfile. Bootstrap and worker processes
+		// parse the same command line but must never overwrite the parent PID.
+		if pidFilePath != "" && os.Getenv("GOBETWEEN_PROCESS_ROLE") == "" {
 			if err := pidfile.WritePidFile(pidFilePath); err != nil {
 				fmt.Printf("Unable to write pidfile %s: %v\n", pidFilePath, err)
 				os.Exit(1)

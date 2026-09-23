@@ -9,6 +9,7 @@ package discovery
 import (
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
@@ -126,14 +127,66 @@ func srvFetch(cfg config.DiscoveryConfig) (*[]core.Backend, error) {
  */
 func srvDnsLookup(cfg config.DiscoveryConfig, pattern string, typ uint16) (*dns.Msg, error) {
 	timeout := utils.ParseDurationOrDefault(cfg.Timeout, srvDefaultWaitTimeout)
-	c := dns.Client{Net: cfg.SrvDnsProtocol, Timeout: timeout}
 	m := dns.Msg{}
-
 	m.SetQuestion(pattern, typ)
 	m.SetEdns0(srvUdpSize, true)
-	r, _, err := c.Exchange(&m, cfg.SrvLookupServer)
 
-	return r, err
+	servers, err := srvDnsServers(cfg.SrvLookupServer)
+	if err != nil {
+		return nil, err
+	}
+
+	network := cfg.SrvDnsProtocol
+	if network == "" {
+		network = "udp"
+	}
+
+	var lastErr error
+	for _, server := range servers {
+		client := dns.Client{Net: network, Timeout: timeout}
+		response, _, exchangeErr := client.Exchange(&m, server)
+		if exchangeErr != nil {
+			lastErr = exchangeErr
+			continue
+		}
+
+		// Large headless-service answers may be truncated over UDP. Retry the
+		// same query over TCP before treating the result as complete.
+		if network == "udp" && response.Truncated {
+			client.Net = "tcp"
+			response, _, exchangeErr = client.Exchange(&m, server)
+			if exchangeErr != nil {
+				lastErr = exchangeErr
+				continue
+			}
+		}
+		return response, nil
+	}
+
+	if lastErr == nil {
+		lastErr = errors.New("no DNS servers configured")
+	}
+	return nil, lastErr
+}
+
+func srvDnsServers(configured string) ([]string, error) {
+	if configured != "" && configured != "system" {
+		return []string{configured}, nil
+	}
+
+	resolver, err := dns.ClientConfigFromFile("/etc/resolv.conf")
+	if err != nil {
+		return nil, fmt.Errorf("failed to read system DNS configuration: %v", err)
+	}
+	if len(resolver.Servers) == 0 {
+		return nil, errors.New("system DNS configuration contains no nameservers")
+	}
+
+	servers := make([]string, 0, len(resolver.Servers))
+	for _, server := range resolver.Servers {
+		servers = append(servers, net.JoinHostPort(server, resolver.Port))
+	}
+	return servers, nil
 }
 
 /**

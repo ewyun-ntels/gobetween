@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net/http"
 	"runtime"
+	"strconv"
+	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -42,7 +44,25 @@ var (
 	backendRxSecond           *prometheus.GaugeVec
 	backendTxSecond           *prometheus.GaugeVec
 	backendLive               *prometheus.GaugeVec
+
+	workerUp       *prometheus.GaugeVec
+	workerRestarts *prometheus.GaugeVec
+
+	aggregateMu       sync.Mutex
+	aggregateServers  = make(map[string]struct{})
+	aggregateBackends = make(map[string]map[core.Target]struct{})
 )
+
+// ServerSnapshot is the process-independent representation used by the
+// supervisor to publish the sum of all worker statistics.
+type ServerSnapshot struct {
+	ActiveConnections uint
+	RxTotal           uint64
+	TxTotal           uint64
+	RxSecond          uint
+	TxSecond          uint
+	Backends          []core.Backend
+}
 
 func defineMetrics() {
 
@@ -153,6 +173,20 @@ func defineMetrics() {
 		Help:      "Backend Alive.",
 	}, []string{"server", "host", "port"})
 
+	workerUp = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: "worker",
+		Name:      "up",
+		Help:      "Whether the UDP worker process is running and reporting heartbeats.",
+	}, []string{"worker"})
+
+	workerRestarts = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: "worker",
+		Name:      "restarts_total",
+		Help:      "Number of UDP worker process restarts.",
+	}, []string{"worker"})
+
 }
 
 func Start(cfg config.MetricsConfig) {
@@ -162,6 +196,7 @@ func Start(cfg config.MetricsConfig) {
 		metricsDisabled = true
 		return
 	}
+	metricsDisabled = false
 
 	log.Info("Starting up Metrics server ", cfg.Bind)
 	defineMetrics()
@@ -184,11 +219,102 @@ func Start(cfg config.MetricsConfig) {
 	prometheus.MustRegister(backendRxSecond)
 	prometheus.MustRegister(backendTxSecond)
 	prometheus.MustRegister(backendLive)
+	prometheus.MustRegister(workerUp)
+	prometheus.MustRegister(workerRestarts)
 
-	http.Handle("/metrics", promhttp.Handler())
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
 	go func() {
-		log.Errorf("Failed to listen and serve prometeus metrics endpoint: %v", http.ListenAndServe(cfg.Bind, nil))
+		log.Errorf("Failed to listen and serve prometeus metrics endpoint: %v", http.ListenAndServe(cfg.Bind, mux))
 	}()
+}
+
+// ReportWorkerState publishes supervisor lifecycle state for a worker.
+func ReportWorkerState(worker int, up bool, restarts uint64) {
+	if metricsDisabled {
+		return
+	}
+
+	value := float64(0)
+	if up {
+		value = 1
+	}
+	label := strconv.Itoa(worker)
+	workerUp.WithLabelValues(label).Set(value)
+	workerRestarts.WithLabelValues(label).Set(float64(restarts))
+}
+
+// ReplaceSnapshots atomically replaces the metrics view assembled from all
+// worker processes and removes labels that disappeared after discovery.
+func ReplaceSnapshots(snapshots map[string]ServerSnapshot) {
+	if metricsDisabled {
+		return
+	}
+
+	aggregateMu.Lock()
+	defer aggregateMu.Unlock()
+
+	for server := range aggregateServers {
+		if _, ok := snapshots[server]; !ok {
+			serverCount.DeleteLabelValues(server)
+			serverActiveConnections.DeleteLabelValues(server)
+			serverRxTotal.DeleteLabelValues(server)
+			serverTxTotal.DeleteLabelValues(server)
+			serverRxSecond.DeleteLabelValues(server)
+			serverTxSecond.DeleteLabelValues(server)
+			for target := range aggregateBackends[server] {
+				removeBackendTarget(server, target)
+			}
+			delete(aggregateServers, server)
+			delete(aggregateBackends, server)
+		}
+	}
+
+	for server, snapshot := range snapshots {
+		aggregateServers[server] = struct{}{}
+		serverActiveConnections.WithLabelValues(server).Set(float64(snapshot.ActiveConnections))
+		serverRxTotal.WithLabelValues(server).Set(float64(snapshot.RxTotal))
+		serverTxTotal.WithLabelValues(server).Set(float64(snapshot.TxTotal))
+		serverRxSecond.WithLabelValues(server).Set(float64(snapshot.RxSecond))
+		serverTxSecond.WithLabelValues(server).Set(float64(snapshot.TxSecond))
+		serverCount.WithLabelValues(server).Set(float64(len(snapshot.Backends)))
+
+		current := make(map[core.Target]struct{}, len(snapshot.Backends))
+		for _, backend := range snapshot.Backends {
+			target := backend.Target
+			current[target] = struct{}{}
+			live := float64(0)
+			if backend.Stats.Live {
+				live = 1
+			}
+			backendActiveConnections.WithLabelValues(server, target.Host, target.Port).Set(float64(backend.Stats.ActiveConnections))
+			backendRefusedConnections.WithLabelValues(server, target.Host, target.Port).Set(float64(backend.Stats.RefusedConnections))
+			backendTotalConnections.WithLabelValues(server, target.Host, target.Port).Set(float64(backend.Stats.TotalConnections))
+			backendRxBytes.WithLabelValues(server, target.Host, target.Port).Set(float64(backend.Stats.RxBytes))
+			backendTxBytes.WithLabelValues(server, target.Host, target.Port).Set(float64(backend.Stats.TxBytes))
+			backendRxSecond.WithLabelValues(server, target.Host, target.Port).Set(float64(backend.Stats.RxSecond))
+			backendTxSecond.WithLabelValues(server, target.Host, target.Port).Set(float64(backend.Stats.TxSecond))
+			backendLive.WithLabelValues(server, target.Host, target.Port).Set(live)
+		}
+
+		for target := range aggregateBackends[server] {
+			if _, ok := current[target]; !ok {
+				removeBackendTarget(server, target)
+			}
+		}
+		aggregateBackends[server] = current
+	}
+}
+
+func removeBackendTarget(server string, target core.Target) {
+	backendActiveConnections.DeleteLabelValues(server, target.Host, target.Port)
+	backendRefusedConnections.DeleteLabelValues(server, target.Host, target.Port)
+	backendTotalConnections.DeleteLabelValues(server, target.Host, target.Port)
+	backendRxBytes.DeleteLabelValues(server, target.Host, target.Port)
+	backendTxBytes.DeleteLabelValues(server, target.Host, target.Port)
+	backendRxSecond.DeleteLabelValues(server, target.Host, target.Port)
+	backendTxSecond.DeleteLabelValues(server, target.Host, target.Port)
+	backendLive.DeleteLabelValues(server, target.Host, target.Port)
 }
 
 func RemoveServer(server string, backends map[core.Target]*core.Backend) {

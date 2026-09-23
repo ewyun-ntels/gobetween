@@ -11,6 +11,7 @@ package config
  * Config file top-level object
  */
 type Config struct {
+	Runtime  RuntimeConfig     `toml:"runtime" json:"runtime"`
 	Logging  LoggingConfig     `toml:"logging" json:"logging"`
 	Api      ApiConfig         `toml:"api" json:"api"`
 	Metrics  MetricsConfig     `toml:"metrics" json:"metrics"`
@@ -18,6 +19,17 @@ type Config struct {
 	Acme     *AcmeConfig       `toml:"acme" json:"acme"`
 	Profiler *ProfilerConfig   `toml:"profiler" json:"profiler"`
 	Servers  map[string]Server `toml:"servers" json:"servers"`
+}
+
+/**
+ * Runtime process configuration.
+ * WorkerProcesses <= 0 keeps the legacy in-process runtime.
+ */
+type RuntimeConfig struct {
+	WorkerProcesses int    `toml:"worker_processes" json:"worker_processes"`
+	RestartWorkers  *bool  `toml:"restart_workers" json:"restart_workers"`
+	RestartBackoff  string `toml:"restart_backoff" json:"restart_backoff"`
+	ShutdownTimeout string `toml:"shutdown_timeout" json:"shutdown_timeout"`
 }
 
 /**

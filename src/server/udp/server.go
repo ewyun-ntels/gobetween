@@ -51,8 +51,10 @@ type Server struct {
 	/* Flag indicating that server is stopped */
 	stopped uint32
 
-	/* Stop channel */
-	stop chan bool
+	/* Stop lifecycle */
+	stop     chan struct{}
+	done     chan struct{}
+	stopOnce sync.Once
 
 	/* ----- modules ----- */
 
@@ -130,7 +132,8 @@ func New(name string, cfg config.Server) (*Server, error) {
 		name:      name,
 		cfg:       cfg,
 		scheduler: scheduler,
-		stop:      make(chan bool),
+		stop:      make(chan struct{}),
+		done:      make(chan struct{}),
 		sessions:  make(map[string]*session.Session),
 	}
 
@@ -169,6 +172,7 @@ func (this *Server) Start() error {
 	this.serve()
 
 	go func() {
+		defer close(this.done)
 
 		ticker := time.NewTicker(CLEANUP_EVERY)
 
@@ -207,12 +211,8 @@ func (this *Server) Start() error {
  * Start accepting connections
  */
 func (this *Server) listen() error {
-	listenAddr, err := net.ResolveUDPAddr("udp", this.cfg.Bind)
-	if err != nil {
-		return fmt.Errorf("Failed to resolve udp address %v : %v", this.cfg.Bind, err)
-	}
-
-	this.serverConn, err = net.ListenUDP("udp", listenAddr)
+	var err error
+	this.serverConn, err = listenUDP(this.cfg.Bind, reusePortEnabled())
 
 	if err != nil {
 		return fmt.Errorf("Failed to create listening udp socket: %v", err)
@@ -429,5 +429,8 @@ func (this *Server) fireAndForget(pool *connPool, clientAddr *net.UDPAddr, buf [
  * Stop, dropping all connections
  */
 func (this *Server) Stop() {
-	this.stop <- true
+	this.stopOnce.Do(func() {
+		close(this.stop)
+	})
+	<-this.done
 }

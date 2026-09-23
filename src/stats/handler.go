@@ -8,6 +8,7 @@ package stats
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/yyyar/gobetween/core"
@@ -24,6 +25,7 @@ const (
  * Handler processess data from server
  */
 type Handler struct {
+	mu sync.RWMutex
 
 	/* Server's name */
 	Name string
@@ -117,20 +119,26 @@ func (this *Handler) Start() {
 
 			/* New server stats available */
 			case b := <-this.ServerStats:
+				this.mu.Lock()
 				this.latestStats.RxTotal = b.RxTotal
 				this.latestStats.TxTotal = b.TxTotal
 				this.latestStats.RxSecond = b.RxSecond
 				this.latestStats.TxSecond = b.TxSecond
+				this.mu.Unlock()
 
 				metrics.ReportHandleStatsChange(fmt.Sprintf("%s", this.Name), b)
 
 			/* New server backends with stats available */
 			case backends := <-this.Backends:
+				this.mu.Lock()
 				this.latestStats.Backends = backends
+				this.mu.Unlock()
 
 			/* New sever connections count available */
 			case connections := <-this.Connections:
+				this.mu.Lock()
 				this.latestStats.ActiveConnections = connections
+				this.mu.Unlock()
 
 				metrics.ReportHandleConnectionsChange(fmt.Sprintf("%s", this.Name), connections)
 
@@ -145,6 +153,18 @@ func (this *Handler) Start() {
 		}
 	}()
 
+}
+
+/**
+ * Snapshot returns a race-free copy of the latest server statistics.
+ */
+func (this *Handler) Snapshot() Stats {
+	this.mu.RLock()
+	defer this.mu.RUnlock()
+
+	result := this.latestStats
+	result.Backends = append([]core.Backend(nil), this.latestStats.Backends...)
+	return result
 }
 
 /**

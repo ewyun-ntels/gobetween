@@ -7,6 +7,8 @@ package discovery
  */
 
 import (
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/yyyar/gobetween/config"
@@ -149,12 +151,23 @@ func (this *Discovery) Start() {
 				return
 			}
 
-			if !this.wait(interval) {
+			if !this.wait(workerJitter(interval)) {
 				log.Info("Stopping discovery ", this.cfg)
 				return
 			}
 		}
 	}()
+}
+
+// workerJitter spreads DNS refreshes from reuse-port workers so they do not
+// all query the cluster DNS service at exactly the same instant.
+func workerJitter(interval time.Duration) time.Duration {
+	workerID, err := strconv.Atoi(os.Getenv("GOBETWEEN_WORKER_ID"))
+	if err != nil || workerID <= 0 || interval <= 0 {
+		return interval
+	}
+	percent := (workerID * 37) % 10
+	return interval + time.Duration(percent)*interval/100
 }
 
 func (this *Discovery) send() bool {

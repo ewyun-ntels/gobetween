@@ -97,13 +97,6 @@ Put `localhost:8000` and `localhost:8001` to `static_list` of static discovery i
 
 * `$ curl http://localhost:3000`
 
-Enable [profiler](https://blog.golang.org/profiling-go-programs) and debug issues you encounter
-```
-[profiler]
-enabled = true     # false | true
-bind    = ":6060"  # "host:port"
-```
-
 ## Performance
 It's Fast! See [Performance Testing](https://github.com/yyyar/gobetween/wiki/Performance-tests)
 
@@ -129,3 +122,59 @@ MIT. See LICENSE file for more details.
 
 ## Logo
 Logo by [Max Demchenko](https://www.linkedin.com/in/max-demchenko-116170112)
+
+## 개발 내역: UDP 멀티프로세스 런타임
+
+Linux에서 하나의 UDP bind 주소를 여러 워커 프로세스가 `SO_REUSEPORT`로 공유하는 실행 모드를 추가했다. 이 모드는 UDP 처리량 확장을 위한 기능이며 TCP/TLS 서버는 지원하지 않는다.
+
+### 설정 예시
+
+```toml
+[runtime]
+worker_processes = 4
+restart_workers = true      # 생략 시 true
+restart_backoff = "1s"      # 생략 시 1s
+shutdown_timeout = "10s"   # 생략 시 10s
+
+[metrics]
+enabled = true
+bind = ":9284"
+
+[defaults]
+max_connections = 0
+client_idle_timeout = "0"
+backend_idle_timeout = "0"
+backend_connection_timeout = "0"
+
+[servers.udpproxy]
+bind = "0.0.0.0:4000"
+protocol = "udp"
+balance = "roundrobin"
+
+  [servers.udpproxy.udp]
+  max_responses = 1
+
+  [servers.udpproxy.discovery]
+  kind = "srv"
+  interval = "10s"
+  timeout = "2s"
+  srv_lookup_pattern = "_backend._udp.my-headless.default.svc.cluster.local."
+  srv_lookup_server = "system"
+  srv_dns_protocol = "udp"
+```
+
+`[api]` 설정은 넣지 않아도 되며 기본값은 비활성이다. 이 UDP 멀티프로세스 런타임에서는 REST API와 profiler를 실행하지 않는다.
+
+### 동작 방식
+
+- 부모 프로세스가 설정 파일 하나로 동일한 UDP 워커들을 실행하고 감시한다.
+- 워커별 CPU 집합은 현재 프로세스에 허용된 CPU를 균등 분배해 자동 계산한다. 워커는 CPU affinity를 먼저 적용한 뒤 재실행되며 `GOMAXPROCS`도 할당 CPU 수로 자동 설정된다.
+- 워커 수가 사용 가능한 CPU 수보다 많으면 CPU를 순환 배정하므로 일부 워커가 같은 CPU를 공유한다.
+- 부모와 워커는 상속된 Unix socketpair(FD 3)에서 길이 헤더가 붙은 JSON 메시지로 ready, heartbeat, stats, shutdown 상태를 교환한다.
+- 워커 비정상 종료 시 기본적으로 재시작하며, 부모 종료 시 모든 워커에 graceful shutdown을 요청한 뒤 제한 시간을 넘긴 워커를 종료한다.
+- 각 워커가 동일한 SRV discovery를 독립적으로 수행한다. `srv_lookup_server = "system"` 또는 해당 항목 생략 시 `/etc/resolv.conf`의 Kubernetes DNS를 사용하며, 큰 UDP DNS 응답이 잘리면 TCP로 다시 질의한다.
+- discovery 갱신 주기에 워커별 지연을 조금 추가해 DNS 질의가 동시에 몰리는 현상을 줄였다.
+- 메트릭 HTTP 서버는 부모만 열고 워커 통계를 합산한다. 기존 server/backend 메트릭 외에 `gobetween_worker_up`, `gobetween_worker_restarts_total`을 제공한다.
+- pidfile은 부모 프로세스만 기록한다.
+
+`[runtime]`을 생략하거나 `worker_processes`가 0이면 기존 단일 프로세스 모드로 실행된다. 멀티프로세스 모드에서 TCP/TLS 서버, REST API, profiler 설정을 활성화하면 시작 단계에서 오류로 종료한다.

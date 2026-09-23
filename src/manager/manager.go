@@ -21,7 +21,6 @@ import (
 	"github.com/yyyar/gobetween/server"
 	"github.com/yyyar/gobetween/service"
 	"github.com/yyyar/gobetween/utils/codec"
-	"github.com/yyyar/gobetween/utils/profiler"
 )
 
 /* Map of app current servers */
@@ -67,9 +66,6 @@ func Initialize(cfg config.Config) {
 		}
 	}
 
-	// Initialize profiler
-	initProfiler(&cfg)
-
 	log.Info("Initialized")
 }
 
@@ -111,18 +107,6 @@ func initConfigGlobals(cfg *config.Config) {
 			cfg.Acme.CacheDir = "/tmp"
 		}
 	}
-}
-
-func initProfiler(cfg *config.Config) {
-	if cfg.Profiler == nil {
-		return
-	}
-
-	if !cfg.Profiler.Enabled {
-		return
-	}
-
-	profiler.Start(cfg.Profiler.Bind)
 }
 
 /**
@@ -238,6 +222,27 @@ func Delete(name string) error {
 	}
 
 	return nil
+}
+
+/**
+ * StopAll stops every configured server. It is used by the worker runtime
+ * during graceful shutdown.
+ */
+func StopAll() {
+	servers.Lock()
+	current := make(map[string]core.Server, len(servers.m))
+	for name, server := range servers.m {
+		current[name] = server
+		delete(servers.m, name)
+	}
+	servers.Unlock()
+
+	for _, server := range current {
+		server.Stop()
+		for _, s := range services {
+			s.Disable(server)
+		}
+	}
 }
 
 /**
@@ -511,6 +516,15 @@ func prepareConfig(name string, server config.Server, defaults config.Connection
 
 	/* SRV Discovery */
 	if server.Discovery.Kind == "srv" {
+		if server.Discovery.SrvDiscoveryConfig == nil {
+			return config.Server{}, errors.New("srv discovery configuration is required")
+		}
+		if server.Discovery.SrvLookupPattern == "" {
+			return config.Server{}, errors.New("srv_lookup_pattern is required for srv discovery")
+		}
+		if server.Discovery.SrvLookupServer == "" {
+			server.Discovery.SrvLookupServer = "system"
+		}
 		switch server.Discovery.SrvDnsProtocol {
 		case
 			"udp",

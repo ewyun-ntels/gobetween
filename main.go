@@ -8,16 +8,18 @@ import (
 	"log"
 	"math/rand"
 	"os"
+	"os/signal"
 	"runtime"
+	"syscall"
 	"time"
 
-	"github.com/yyyar/gobetween/api"
 	"github.com/yyyar/gobetween/cmd"
 	"github.com/yyyar/gobetween/config"
 	"github.com/yyyar/gobetween/info"
 	"github.com/yyyar/gobetween/logging"
 	"github.com/yyyar/gobetween/manager"
 	"github.com/yyyar/gobetween/metrics"
+	"github.com/yyyar/gobetween/multiprocess"
 	"github.com/yyyar/gobetween/utils/codec"
 )
 
@@ -55,6 +57,14 @@ func init() {
  * Entry point
  */
 func main() {
+	// The bootstrap applies CPU affinity and execs a fresh worker before any
+	// configuration parsing or pidfile handling takes place.
+	if multiprocess.IsBootstrap() {
+		if err := multiprocess.ExecWorkerWithAffinity(); err != nil {
+			log.Fatal("Failed to bootstrap worker: ", err)
+		}
+		return
+	}
 
 	log.Printf("gobetween v%s", version)
 
@@ -79,16 +89,28 @@ func main() {
 		// Configure logging
 		logging.Configure(cfg.Logging.Output, cfg.Logging.Level, cfg.Logging.Format)
 
-		// Start manager
+		if multiprocess.IsWorker() {
+			if err := multiprocess.RunWorker(*cfg); err != nil {
+				log.Fatal("Worker failed: ", err)
+			}
+			return
+		}
+
+		if cfg.Runtime.WorkerProcesses > 0 {
+			if err := multiprocess.RunSupervisor(*cfg); err != nil {
+				log.Fatal("Supervisor failed: ", err)
+			}
+			return
+		}
+
+		// Legacy single-process mode remains available when [runtime] is absent.
+		metrics.Start(cfg.Metrics)
 		manager.Initialize(*cfg)
 
-		/* setup metrics */
-		metrics.Start((*cfg).Metrics)
-
-		// Start API
-		api.Start((*cfg).Api)
-
-		// block forever
-		<-(chan string)(nil)
+		signals := make(chan os.Signal, 1)
+		signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+		<-signals
+		signal.Stop(signals)
+		manager.StopAll()
 	})
 }
