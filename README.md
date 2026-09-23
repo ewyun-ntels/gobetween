@@ -178,3 +178,115 @@ balance = "roundrobin"
 - pidfile은 부모 프로세스만 기록한다.
 
 `[runtime]`을 생략하거나 `worker_processes`가 0이면 기존 단일 프로세스 모드로 실행된다. 멀티프로세스 모드에서 TCP/TLS 서버, REST API, profiler 설정을 활성화하면 시작 단계에서 오류로 종료한다.
+
+## 후속 검토: Linux UDP 배치 I/O
+
+> 상태: 설계 검토 항목이며 아직 구현되지 않았다. 현재 실행 코드는 `net.UDPConn.ReadFromUDP`와 `Conn.Write`를 패킷마다 호출한다.
+
+응답을 받지 않는 UDP fire-and-forget 용도에서는 Linux의 `recvmmsg(2)`와 `sendmmsg(2)`를 이용해 한 번의 syscall로 여러 datagram을 처리할 수 있다. 적용 대상은 Linux UDP 멀티프로세스 모드이며 TCP/TLS 및 요청·응답형 UDP 세션은 대상에서 제외한다.
+
+### 적용 조건
+
+```toml
+[runtime]
+worker_processes = 4
+
+[servers.udpproxy.udp]
+max_requests = 1
+max_responses = 0
+```
+
+현재 구현에서 `max_responses = 0`은 응답 수신을 비활성화한다는 뜻이 아니라 응답 횟수를 제한하지 않는다는 뜻이다. `max_requests = 1`을 함께 설정해야 세션과 응답 수신 고루틴을 만들지 않는 fire-and-forget 경로를 사용한다.
+
+향후 배치 크기를 설정으로 노출한다면 다음 형태를 사용한다. 아래 `io_batch_size`는 제안된 설정이며 현재는 사용할 수 없다.
+
+```toml
+[servers.udpproxy.udp]
+max_requests = 1
+max_responses = 0
+io_batch_size = 32
+```
+
+초기 기본값은 32를 사용하고 1로 설정하면 기존 패킷 단위 처리와 동일하게 동작하도록 한다. 운영 환경에서는 16, 32, 64를 비교해 CPU 사용률, 지연 시간 및 drop 수를 기준으로 선택한다.
+
+### 수신 경로
+
+워커별 `SO_REUSEPORT` UDP 소켓과 CPU affinity 구조는 유지한다. 각 워커의 수신 루프만 다음과 같이 변경한다.
+
+```text
+SO_REUSEPORT UDP socket
+        │
+        ▼
+recvmmsg(batchSize)
+        │
+        ├─ 접근 제어
+        ├─ 패킷별 백엔드 선택
+        └─ 백엔드 소켓별 송신 묶음 생성
+```
+
+- `recvmmsg`에 전달할 message descriptor, source address, payload buffer 배열을 워커 시작 시 미리 할당하고 반복해서 재사용한다.
+- 기존 최대 UDP payload인 65,507바이트를 계속 지원해야 한다. 메모리 사용량은 대략 `worker_processes × io_batch_size × 65,507`바이트에 descriptor 및 송신 큐 메모리가 추가된다.
+- listener의 nonblocking 동작과 Go runtime poller를 유지한다. `EAGAIN`이면 poller가 다음 readable 이벤트를 기다리게 하고, `EINTR`은 같은 batch를 다시 시도한다.
+- `MSG_TRUNC`가 확인된 datagram은 전달하지 않고 별도 drop 메트릭을 증가시킨다.
+- 한 flow 내부의 입력 순서는 유지하되 UDP 자체는 전달 순서를 보장하지 않는다는 전제를 유지한다.
+
+### 송신 경로
+
+수신 batch의 각 datagram에 대해 기존 balance 정책으로 백엔드를 선택한 후, 같은 backend socket으로 전송할 datagram을 묶는다.
+
+```text
+received batch
+    │
+    ├─ backend A ── sendmmsg(socket A)
+    ├─ backend B ── sendmmsg(socket B)
+    └─ backend C ── sendmmsg(socket C)
+```
+
+- fire-and-forget connection pool의 연결된 UDP socket을 계속 재사용한다.
+- 같은 backend로 선택된 datagram만 하나의 `sendmmsg` 호출에 넣는다. 백엔드 수가 많거나 선택 결과가 고르게 분산되면 송신 batch가 작아져 성능 이득도 감소한다.
+- `sendmmsg`가 일부 datagram만 전송한 경우 반환된 개수 이후의 message만 재시도해 중복 송신을 방지한다.
+- `EAGAIN` 발생 시 무제한 대기하지 않는다. 제한된 worker-local pending queue를 사용하고 큐가 가득 차면 명시적인 drop 정책과 메트릭을 적용한다.
+- 패킷별 임시 slice와 goroutine 생성을 피하고, batch가 처리된 뒤 payload buffer를 재사용한다.
+
+### Scheduler 및 통계 처리
+
+소켓 syscall만 배치화하면 기존 scheduler와 통계 채널이 다음 병목이 될 수 있다. 배치 I/O와 함께 아래 변경을 검토한다.
+
+- 패킷마다 동기 채널을 왕복하는 대신 한 batch의 backend 선택 요청을 한 번에 전달한다.
+- backend별 Tx byte와 packet 수를 batch 내부에서 합산한 뒤 통계 채널에 한 번만 전달한다.
+- 수신 packet, 송신 packet, syscall, partial send, queue drop, truncated packet 수를 워커별 counter로 관리한다.
+- 부모 프로세스는 기존 IPC stats 메시지에 워커 counter를 포함해 합산한다.
+- roundrobin 등 기존 balance 의미가 batch 경계 때문에 달라지지 않도록 패킷 순서대로 backend를 결정한다.
+
+### 구현 순서
+
+1. 기존 `net.UDPConn` 경로를 유지한 상태에서 Linux 전용 `recvmmsg` 수신 구현과 단위 테스트를 추가한다.
+2. `io_batch_size = 1`과 기존 구현의 동작 및 패킷 전달 결과가 같은지 확인한다.
+3. 수신 batch만 활성화해 syscall 수, CPU 사용률, PPS 및 drop을 비교한다.
+4. backend socket별 `sendmmsg` 송신 batch와 partial-send 처리를 추가한다.
+5. scheduler 선택과 통계 업데이트를 batch 단위로 변경한다.
+6. 설정으로 기존 경로와 batch 경로를 선택할 수 있게 한 뒤 장시간 부하 및 graceful shutdown을 검증한다.
+7. 충분한 결과가 확인된 후에만 batch 경로를 기본값으로 변경한다.
+
+### 예상 성능과 검증 기준
+
+4워커, 작은 UDP 패킷, 다수의 source port, 충분한 CPU 및 NIC queue, 응답 없는 fire-and-forget 조건의 1차 예상치는 다음과 같다. 실제 성능은 CPU, NIC, 백엔드 수, 패킷 크기와 scheduler 비용에 따라 달라지므로 보장값이 아니다.
+
+| 처리 방식 | 예상 입력 처리량 | 예상 NIC 전체 처리량 |
+|---|---:|---:|
+| 현재 패킷 단위 `net.UDPConn` | 600K~1M PPS | 1.2M~2M PPS |
+| `recvmmsg` 수신 batch | 850K~1.2M PPS | 1.7M~2.4M PPS |
+| `recvmmsg` + `sendmmsg` | 1M~1.4M PPS | 2M~2.8M PPS |
+
+성능 검증에서는 평균 PPS뿐 아니라 다음 항목을 함께 확인한다.
+
+- p50/p95/p99 전달 지연 시간
+- 워커별 패킷 분배 편차
+- syscall당 평균 datagram 수
+- UDP socket receive/send buffer drop
+- pending queue drop과 partial send 횟수
+- 워커 CPU 사용률과 scheduler/stat 처리 비중
+- backend별 전송 순서와 balance 분포
+- 워커 재시작 및 graceful shutdown 중 패킷 손실 범위
+
+하나의 source IP/port로 구성된 단일 UDP flow는 `SO_REUSEPORT` 해시에 의해 한 워커로 고정될 수 있다. 4워커 성능을 검증할 때는 충분히 많은 source port 또는 source IP를 사용해 워커와 NIC queue에 트래픽이 고르게 분산되도록 해야 한다.
