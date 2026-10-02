@@ -9,6 +9,7 @@ package udp
 import (
 	"fmt"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,6 +25,7 @@ import (
 	"github.com/yyyar/gobetween/server/scheduler"
 	"github.com/yyyar/gobetween/server/udp/session"
 	"github.com/yyyar/gobetween/stats"
+	"github.com/yyyar/gobetween/udpdispatch"
 	"github.com/yyyar/gobetween/utils"
 )
 
@@ -211,7 +213,26 @@ func (this *Server) Start() error {
  * Start accepting connections
  */
 func (this *Server) listen() error {
-	var err error
+	mode, err := config.UDPDistribution(this.cfg)
+	if err != nil {
+		return err
+	}
+	if mode == "rr" {
+		if !reusePortEnabled() {
+			return fmt.Errorf("rr requires the Linux worker runtime")
+		}
+		connection, inherited, err := udpdispatch.ListenInherited(this.name, this.cfg.Bind)
+		if err != nil {
+			return err
+		}
+		if inherited {
+			this.serverConn = connection
+			return nil
+		}
+		if os.Getenv(udpdispatch.WorkerCountEnv) != "1" {
+			return fmt.Errorf("missing inherited rr listener %q", this.name)
+		}
+	}
 	this.serverConn, err = listenUDP(this.cfg.Bind, reusePortEnabled())
 
 	if err != nil {

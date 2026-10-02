@@ -4,9 +4,12 @@ go 1.24
 
 replace github.com/yyyar/gobetween => ./src
 
+replace github.com/eric-lindau/udpfacade => github.com/illarion/udpfacade v0.0.0-20190425230512-031998cc71fa
+
 require github.com/yyyar/gobetween v0.0.0-20220331192546-6e185295c847
 
 require (
+	github.com/cilium/ebpf v0.17.3 // indirect
 	github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/armon/go-metrics v0.4.1 // indirect

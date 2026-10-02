@@ -22,6 +22,10 @@ func allowedCPUs() ([]int, error) {
 	return nil, errors.New("CPU affinity requires Linux")
 }
 
+func readCoreCPUs(cpu int) ([]int, error) {
+	return nil, errors.New("physical CPU allocation requires Linux")
+}
+
 func ExecWorkerWithAffinity() error {
 	return errors.New("UDP multiprocess runtime requires Linux")
 }

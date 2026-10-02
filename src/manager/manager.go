@@ -262,6 +262,9 @@ func Stats(name string) interface{} {
  * TODO: make validation better
  */
 func prepareConfig(name string, server config.Server, defaults config.ConnectionOptions) (config.Server, error) {
+	if _, err := config.UDPDistribution(server); err != nil {
+		return config.Server{}, err
+	}
 
 	/* ----- Prerequisites ----- */
 

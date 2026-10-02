@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "gobetween.fullname" . }}
+  labels:
+    {{- include "gobetween.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "gobetween.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: udp
+      port: {{ .Values.service.port }}
+      targetPort: udp
+      protocol: UDP
+{{- if .Values.metrics.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "gobetween.fullname" . }}-metrics
+  labels:
+    {{- include "gobetween.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "gobetween.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.metrics.port }}
+      targetPort: metrics
+      protocol: TCP
+{{- end }}

@@ -2,7 +2,10 @@ module github.com/yyyar/gobetween
 
 go 1.24
 
+replace github.com/eric-lindau/udpfacade => github.com/illarion/udpfacade v0.0.0-20190425230512-031998cc71fa
+
 require (
+	github.com/cilium/ebpf v0.17.3
 	github.com/burntsushi/toml v0.3.1
 	github.com/elgs/gojq v0.0.0-20230628214826-df5c4045598e
 	github.com/eric-lindau/udpfacade v0.0.0-20190621043444-d8c1c27add16

@@ -246,8 +246,8 @@ func (this *Server) wrap(conn net.Conn, sniEnabled bool) {
 	}
 
 	this.connect <- &core.TcpContext{
-		hostname,
-		conn,
+		Hostname: hostname,
+		Conn:     conn,
 	}
 
 }

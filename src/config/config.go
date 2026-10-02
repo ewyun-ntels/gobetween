@@ -27,6 +27,7 @@ type Config struct {
  */
 type RuntimeConfig struct {
 	WorkerProcesses int    `toml:"worker_processes" json:"worker_processes"`
+	WorkerCPUPolicy string `toml:"worker_cpu_policy" json:"worker_cpu_policy"`
 	RestartWorkers  *bool  `toml:"restart_workers" json:"restart_workers"`
 	RestartBackoff  string `toml:"restart_backoff" json:"restart_backoff"`
 	ShutdownTimeout string `toml:"shutdown_timeout" json:"shutdown_timeout"`
@@ -195,9 +196,10 @@ type BackendsTls struct {
  * for protocol = "udp"
  */
 type Udp struct {
-	MaxRequests  uint64 `toml:"max_requests" json:"max_requests"`
-	MaxResponses uint64 `toml:"max_responses" json:"max_responses"`
-	Transparent  bool   `toml:"transparent" json:"transparent"`
+	MaxRequests           uint64 `toml:"max_requests" json:"max_requests"`
+	MaxResponses          uint64 `toml:"max_responses" json:"max_responses"`
+	Transparent           bool   `toml:"transparent" json:"transparent"`
+	ReusePortDistribution string `toml:"reuse_port_distribution" json:"reuse_port_distribution"`
 }
 
 /**

@@ -1,0 +1,38 @@
+# UDP-only example. Replace SRV name with your existing Headless Service.
+# Hash is runnable without BPF privileges; RR needs approved effective CAP_BPF.
+[logging]
+level = "info"
+output = "stdout"
+format = "text"
+
+[runtime]
+worker_processes = 4
+worker_cpu_policy = "physical"
+restart_workers = true
+restart_backoff = "1s"
+shutdown_timeout = "10s"
+
+[metrics]
+enabled = true
+bind = "0.0.0.0:9284"
+
+[servers.udpproxy]
+bind = "0.0.0.0:4000"
+protocol = "udp"
+balance = "roundrobin"
+client_idle_timeout = "0"
+backend_idle_timeout = "0"
+backend_connection_timeout = "0"
+
+  [servers.udpproxy.udp]
+  reuse_port_distribution = "hash"
+  max_requests = 1
+  max_responses = 0
+
+  [servers.udpproxy.discovery]
+  kind = "srv"
+  interval = "10s"
+  timeout = "2s"
+  srv_lookup_server = "system"
+  srv_dns_protocol = "udp"
+  srv_lookup_pattern = "_backend._udp.backend-headless.default.svc.cluster.local."

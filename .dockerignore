@@ -1,0 +1,7 @@
+.git
+bin
+dist
+*.snap
+charts
+test/testdata/ambient-launcher
+.codex

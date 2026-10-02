@@ -1,0 +1,10 @@
+UDP-only configuration prepared for {{ include "gobetween.fullname" . }}.
+Workers: {{ .Values.runtime.workerProcesses }}; CPU policy: {{ .Values.runtime.workerCPUPolicy }}.
+API and profiler are absent/disabled. No backend Headless Service is created.
+{{ if include "gobetween.needsBPF" . }}
+RR requires CAP_BPF in the initial user namespace and an approved seccomp/SCC policy.
+{{ if not .Values.openshift.sccName }}WARNING: no SCC-use binding is configured. Restricted SCC normally rejects CAP_BPF; approve a dedicated SCC before deployment.{{ end }}
+{{ end }}
+Probes only check the parent listener. Pod Ready does NOT certify worker/backend readiness.
+Check gobetween_worker_up, discovered backends and actual UDP forwarding after deployment.
+Recreate upgrades interrupt traffic; UDP in-flight packets are not guaranteed across restarts.

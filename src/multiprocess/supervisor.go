@@ -1,6 +1,7 @@
 package multiprocess
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/yyyar/gobetween/logging"
 	"github.com/yyyar/gobetween/metrics"
 	"github.com/yyyar/gobetween/stats"
+	"github.com/yyyar/gobetween/udpdispatch"
 )
 
 const heartbeatTimeout = 15 * time.Second
@@ -23,6 +25,8 @@ const heartbeatTimeout = 15 * time.Second
 var supervisorLog = logging.For("supervisor")
 
 type workerSlot struct {
+	dispatch      udpdispatch.Controller
+	workerCount   int
 	id            int
 	cpus          []int
 	generation    uint64
@@ -64,10 +68,15 @@ func RunSupervisor(cfg config.Config) error {
 	if err != nil {
 		return fmt.Errorf("read allowed CPU set: %w", err)
 	}
-	partitions, err := splitCPUs(available, cfg.Runtime.WorkerProcesses)
+	policy, err := config.CPUAllocationPolicy(cfg.Runtime)
 	if err != nil {
 		return err
 	}
+	partitions, err := partitionWorkerCPUs(available, cfg.Runtime.WorkerProcesses, policy, readCoreCPUs)
+	if err != nil {
+		return fmt.Errorf("allocate worker CPUs (%s): %w", policy, err)
+	}
+	supervisorLog.Infof("Worker CPU policy=%s allowed_cpus=%s workers=%d", policy, formatCPUList(available), cfg.Runtime.WorkerProcesses)
 	if cfg.Runtime.WorkerProcesses > len(available) {
 		supervisorLog.Warnf("worker_processes=%d exceeds available CPUs=%d; workers will share CPUs", cfg.Runtime.WorkerProcesses, len(available))
 	}
@@ -85,11 +94,18 @@ func RunSupervisor(cfg config.Config) error {
 		return err
 	}
 
+	dispatch, err := udpdispatch.NewController(cfg)
+	if err != nil {
+		return err
+	}
+	if dispatch != nil {
+		defer dispatch.Close()
+	}
 	metrics.Start(cfg.Metrics)
 	events := make(chan workerEvent, cfg.Runtime.WorkerProcesses*4)
 	slots := make([]*workerSlot, cfg.Runtime.WorkerProcesses)
 	for index := range slots {
-		slots[index] = &workerSlot{id: index + 1, cpus: partitions[index]}
+		slots[index] = &workerSlot{id: index + 1, cpus: partitions[index], dispatch: dispatch, workerCount: cfg.Runtime.WorkerProcesses}
 		metrics.ReportWorkerState(index+1, false, 0)
 		if err := startWorker(slots[index], events); err != nil {
 			shutdownWorkerSet(slots, events, shutdownTimeout)
@@ -113,7 +129,10 @@ func RunSupervisor(cfg config.Config) error {
 			metrics.ReplaceSnapshots(map[string]metrics.ServerSnapshot{})
 			return nil
 		case event := <-events:
-			handleWorkerEvent(event, slots, events, restartEnabled, restartBackoff)
+			if err := handleWorkerEvent(event, slots, events, restartEnabled, restartBackoff); err != nil {
+				shutdownWorkerSet(slots, events, shutdownTimeout)
+				return err
+			}
 		case now := <-watchdog.C:
 			for _, slot := range slots {
 				if slot.command == nil {
@@ -125,6 +144,12 @@ func RunSupervisor(cfg config.Config) error {
 				}
 				if now.Sub(lastSeen) > heartbeatTimeout {
 					supervisorLog.Errorf("Worker %d heartbeat timed out; terminating pid=%d", slot.id, slot.command.Process.Pid)
+					if slot.dispatch != nil {
+						if err := slot.dispatch.Remove(slot.id); err != nil {
+							shutdownWorkerSet(slots, events, shutdownTimeout)
+							return err
+						}
+					}
 					_ = slot.command.Process.Kill()
 				}
 			}
@@ -133,6 +158,12 @@ func RunSupervisor(cfg config.Config) error {
 }
 
 func validateSupervisorConfig(cfg config.Config) error {
+	if _, err := config.CPUAllocationPolicy(cfg.Runtime); err != nil {
+		return err
+	}
+	if err := config.ValidateUDPDistributions(cfg); err != nil {
+		return err
+	}
 	if cfg.Runtime.WorkerProcesses <= 0 {
 		return fmt.Errorf("worker_processes must be greater than zero")
 	}
@@ -181,6 +212,18 @@ func startWorker(slot *workerSlot, events chan<- workerEvent) error {
 	command.Stdout = os.Stdout
 	command.Stderr = os.Stderr
 	command.ExtraFiles = []*os.File{childFile}
+	var listeners map[string]udpdispatch.InheritedListener
+	if slot.dispatch != nil {
+		files, descriptors, err := slot.dispatch.Prepare(slot.id)
+		if err != nil {
+			_ = channel.Close()
+			_ = childFile.Close()
+			return err
+		}
+		command.ExtraFiles = append(command.ExtraFiles, files...)
+		listeners = descriptors
+	}
+	encodedListeners, _ := json.Marshal(listeners)
 	configureWorkerCommand(command)
 
 	env := replaceEnv(os.Environ(), "GOBETWEEN", "")
@@ -189,10 +232,15 @@ func startWorker(slot *workerSlot, events chan<- workerEvent) error {
 	env = replaceEnv(env, envWorkerCPUs, formatCPUList(slot.cpus))
 	env = replaceEnv(env, envIPCFile, "3")
 	env = replaceEnv(env, envReusePort, "1")
+	env = replaceEnv(env, udpdispatch.ListenersEnv, string(encodedListeners))
+	env = replaceEnv(env, udpdispatch.WorkerCountEnv, strconv.Itoa(slot.workerCount))
 	env = replaceEnv(env, "GOMAXPROCS", "")
 	command.Env = env
 
 	if err := command.Start(); err != nil {
+		if slot.dispatch != nil {
+			_ = slot.dispatch.Remove(slot.id)
+		}
 		_ = channel.Close()
 		_ = childFile.Close()
 		return err
@@ -229,19 +277,27 @@ func readWorker(workerID int, generation uint64, channel *Channel, events chan<-
 	}
 }
 
-func handleWorkerEvent(event workerEvent, slots []*workerSlot, events chan<- workerEvent, restartEnabled bool, restartBackoff time.Duration) {
+func handleWorkerEvent(event workerEvent, slots []*workerSlot, events chan<- workerEvent, restartEnabled bool, restartBackoff time.Duration) error {
 	if event.workerID <= 0 || event.workerID > len(slots) {
-		return
+		return nil
 	}
 	slot := slots[event.workerID-1]
 	if event.generation != slot.generation {
-		return
+		return nil
 	}
 
 	switch event.kind {
 	case eventMessage:
 		switch event.message.Type {
 		case messageReady:
+			if slot.ready {
+				return nil
+			}
+			if slot.dispatch != nil {
+				if err := slot.dispatch.Ready(slot.id); err != nil {
+					return fmt.Errorf("activate worker %d RR listeners: %w", slot.id, err)
+				}
+			}
 			slot.ready = true
 			slot.lastHeartbeat = time.Now()
 			metrics.ReportWorkerState(slot.id, true, slot.restarts)
@@ -257,9 +313,21 @@ func handleWorkerEvent(event workerEvent, slots []*workerSlot, events chan<- wor
 			supervisorLog.Errorf("Worker %d error: %s", slot.id, event.message.Error)
 		}
 	case eventReadEnd:
+		if slot.dispatch != nil {
+			if err := slot.dispatch.Remove(slot.id); err != nil {
+				return err
+			}
+			slot.ready = false
+			metrics.ReportWorkerState(slot.id, false, slot.restarts)
+		}
 		// Wait owns lifecycle and restart decisions; the socket normally closes
 		// just before the process exit notification arrives.
 	case eventExit:
+		if slot.dispatch != nil {
+			if err := slot.dispatch.Remove(slot.id); err != nil {
+				return err
+			}
+		}
 		if slot.channel != nil {
 			_ = slot.channel.Close()
 		}
@@ -287,7 +355,7 @@ func handleWorkerEvent(event workerEvent, slots []*workerSlot, events chan<- wor
 		}
 	case eventRestart:
 		if slot.command != nil {
-			return
+			return nil
 		}
 		if err := startWorker(slot, events); err != nil {
 			supervisorLog.Errorf("Failed to restart worker %d: %v", slot.id, err)
@@ -300,11 +368,20 @@ func handleWorkerEvent(event workerEvent, slots []*workerSlot, events chan<- wor
 			}(slot.id)
 		}
 	}
+	return nil
 }
 
 func shutdownWorkerSet(slots []*workerSlot, events <-chan workerEvent, timeout time.Duration) {
 	remaining := 0
 	for _, slot := range slots {
+		if slot == nil {
+			continue
+		}
+		if slot.dispatch != nil {
+			if err := slot.dispatch.Remove(slot.id); err != nil {
+				supervisorLog.Errorf("Exclude stopping worker %d: %v", slot.id, err)
+			}
+		}
 		if slot.command == nil {
 			continue
 		}
@@ -334,6 +411,9 @@ func shutdownWorkerSet(slots []*workerSlot, events <-chan workerEvent, timeout t
 			remaining--
 		case <-timer.C:
 			for _, slot := range slots {
+				if slot == nil {
+					continue
+				}
 				if slot.command != nil {
 					supervisorLog.Warnf("Force killing worker %d pid=%d after shutdown timeout", slot.id, slot.command.Process.Pid)
 					_ = slot.command.Process.Kill()

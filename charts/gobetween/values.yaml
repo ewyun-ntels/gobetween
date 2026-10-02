@@ -1,0 +1,73 @@
+# One Pod: one supervisor and four identical UDP worker processes.
+replicaCount: 1
+image:
+  repository: gobetween-local
+  tag: udp-dev
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+runtime:
+  workerProcesses: 4
+  workerCPUPolicy: physical
+  restartBackoffSeconds: 1
+  shutdownTimeoutSeconds: 10
+terminationGracePeriodSeconds: 30
+# Requests and limits are generated identically for Guaranteed QoS.
+# Investigated nodes: SMT=2, so 8 logical CPUs represent 4 full cores.
+# Memory is an initial example, NOT a measured production requirement.
+resources:
+  cpu: 8
+  memory: 1Gi
+udp:
+  port: 4000
+  reusePortDistribution: rr
+  balance: roundrobin
+  maxRequests: 1
+  maxResponses: 0
+  clientIdleTimeout: "0"
+  backendIdleTimeout: "0"
+# EXISTING Headless Service; portName must match its named UDP port.
+# Empty namespace uses the release namespace; srvLookupPattern overrides DNS.
+discovery:
+  kind: srv
+  interval: 10s
+  timeout: 2s
+  serviceName: backend-headless
+  namespace: ""
+  portName: backend
+  clusterDomain: cluster.local
+  srvLookupPattern: ""
+  staticList: []
+metrics:
+  enabled: true
+  port: 9284
+  # Probes check only the parent listener, NOT workers/backends.
+  probesEnabled: true
+service:
+  type: ClusterIP
+  port: 4000
+  annotations: {}
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+openshift:
+  # Existing administrator-approved SCC; empty generates no SCC-use RBAC.
+  sccName: ""
+# No runAsUser: OpenShift assigns an arbitrary namespace UID.
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+# RR with >1 worker automatically requests BPF; hash does not.
+extraCapabilities: []
+hostUsers: true
+podAnnotations: {}
+nodeSelector:
+  kubernetes.io/os: linux
+tolerations: []
+affinity: {}

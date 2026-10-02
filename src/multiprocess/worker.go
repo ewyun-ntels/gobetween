@@ -13,6 +13,7 @@ import (
 	"github.com/yyyar/gobetween/manager"
 	"github.com/yyyar/gobetween/metrics"
 	"github.com/yyyar/gobetween/stats"
+	"github.com/yyyar/gobetween/udpdispatch"
 )
 
 const (
@@ -35,6 +36,10 @@ func RunWorker(cfg config.Config) error {
 	defer channel.Close()
 
 	if err := validateWorkerConfig(cfg); err != nil {
+		_ = channel.Send(Message{Type: messageError, WorkerID: workerID, PID: os.Getpid(), Error: err.Error()})
+		return err
+	}
+	if err := udpdispatch.ValidateInherited(cfg); err != nil {
 		_ = channel.Send(Message{Type: messageError, WorkerID: workerID, PID: os.Getpid(), Error: err.Error()})
 		return err
 	}

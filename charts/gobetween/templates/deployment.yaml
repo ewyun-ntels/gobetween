@@ -1,0 +1,99 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gobetween.fullname" . }}
+  labels:
+    {{- include "gobetween.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  # Replacing the Pod interrupts traffic; in-flight UDP is not preserved.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "gobetween.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "gobetween.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "gobetween.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      hostUsers: {{ .Values.hostUsers }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: gobetween
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["-c", "/etc/gobetween/conf/gobetween.toml"]
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+            capabilities:
+              drop: ["ALL"]
+              {{- $caps := .Values.extraCapabilities -}}
+              {{- if include "gobetween.needsBPF" . -}}
+              {{- $caps = prepend $caps "BPF" -}}
+              {{- end }}
+              {{- if $caps }}
+              add: {{ $caps | uniq | toJson }}
+              {{- end }}
+          ports:
+            - name: udp
+              containerPort: {{ .Values.udp.port }}
+              protocol: UDP
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
+            {{- end }}
+          {{- if and .Values.metrics.enabled .Values.metrics.probesEnabled }}
+          startupProbe:
+            tcpSocket:
+              port: metrics
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            tcpSocket:
+              port: metrics
+            periodSeconds: 10
+            failureThreshold: 3
+          {{- end }}
+          resources:
+            requests:
+              cpu: {{ .Values.resources.cpu | quote }}
+              memory: {{ .Values.resources.memory | quote }}
+            limits:
+              cpu: {{ .Values.resources.cpu | quote }}
+              memory: {{ .Values.resources.memory | quote }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/gobetween/conf
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "gobetween.fullname" . }}
+            defaultMode: 0444
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

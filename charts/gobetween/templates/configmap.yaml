@@ -1,0 +1,55 @@
+{{- include "gobetween.validate" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "gobetween.fullname" . }}
+  labels:
+    {{- include "gobetween.labels" . | nindent 4 }}
+data:
+  gobetween.toml: |
+    [logging]
+    level = "info"
+    output = "stdout"
+    format = "text"
+
+    [runtime]
+    worker_processes = {{ .Values.runtime.workerProcesses }}
+    worker_cpu_policy = {{ .Values.runtime.workerCPUPolicy | quote }}
+    restart_workers = true
+    restart_backoff = "{{ .Values.runtime.restartBackoffSeconds }}s"
+    shutdown_timeout = "{{ .Values.runtime.shutdownTimeoutSeconds }}s"
+
+    [metrics]
+    enabled = {{ .Values.metrics.enabled }}
+    bind = "0.0.0.0:{{ .Values.metrics.port }}"
+
+    [defaults]
+    max_connections = 0
+    client_idle_timeout = {{ .Values.udp.clientIdleTimeout | quote }}
+    backend_idle_timeout = {{ .Values.udp.backendIdleTimeout | quote }}
+    backend_connection_timeout = "0"
+
+    [servers.udpproxy]
+    bind = "0.0.0.0:{{ .Values.udp.port }}"
+    protocol = "udp"
+    balance = {{ .Values.udp.balance | quote }}
+    # Explicit server values are required by the existing UDP validator.
+    client_idle_timeout = {{ .Values.udp.clientIdleTimeout | quote }}
+    backend_idle_timeout = {{ .Values.udp.backendIdleTimeout | quote }}
+
+      [servers.udpproxy.udp]
+      reuse_port_distribution = {{ .Values.udp.reusePortDistribution | quote }}
+      max_requests = {{ .Values.udp.maxRequests }}
+      max_responses = {{ .Values.udp.maxResponses }}
+
+      [servers.udpproxy.discovery]
+      kind = {{ .Values.discovery.kind | quote }}
+      interval = {{ .Values.discovery.interval | quote }}
+      timeout = {{ .Values.discovery.timeout | quote }}
+      {{- if eq .Values.discovery.kind "srv" }}
+      srv_lookup_server = "system"
+      srv_dns_protocol = "udp"
+      srv_lookup_pattern = {{ default (printf "_%s._udp.%s.%s.svc.%s." .Values.discovery.portName .Values.discovery.serviceName (default .Release.Namespace .Values.discovery.namespace) .Values.discovery.clusterDomain) .Values.discovery.srvLookupPattern | quote }}
+      {{- else }}
+      static_list = {{ .Values.discovery.staticList | toJson }}
+      {{- end }}

@@ -1,0 +1,39 @@
+# ADMIN REVIEW ONLY. Helm templates do NOT create or apply this object.
+# CAP_BPF allowance does not itself prove effective capabilities at exec time.
+# Verify actual CRI-O capabilities/seccomp/SELinux on the target node first.
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: gobetween-udp-rr
+allowPrivilegedContainer: false
+allowPrivilegeEscalation: false
+defaultAllowPrivilegeEscalation: false
+allowHostDirVolumePlugin: false
+allowHostIPC: false
+allowHostNetwork: false
+allowHostPID: false
+allowHostPorts: false
+readOnlyRootFilesystem: true
+userNamespaceLevel: AllowHostLevel
+allowedCapabilities:
+  - BPF
+requiredDropCapabilities:
+  - ALL
+defaultAddCapabilities: []
+runAsUser:
+  type: MustRunAsRange
+seLinuxContext:
+  type: MustRunAs
+fsGroup:
+  type: MustRunAs
+supplementalGroups:
+  type: RunAsAny
+seccompProfiles:
+  - runtime/default
+volumes:
+  - configMap
+  - projected
+  - secret
+  - downwardAPI
+users: []
+groups: []

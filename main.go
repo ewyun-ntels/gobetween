@@ -88,6 +88,12 @@ func main() {
 
 		// Configure logging
 		logging.Configure(cfg.Logging.Output, cfg.Logging.Level, cfg.Logging.Format)
+		if _, err := config.CPUAllocationPolicy(cfg.Runtime); err != nil {
+			log.Fatal("Invalid worker CPU policy: ", err)
+		}
+		if err := config.ValidateUDPDistributions(*cfg); err != nil {
+			log.Fatal("Invalid UDP worker distribution: ", err)
+		}
 
 		if multiprocess.IsWorker() {
 			if err := multiprocess.RunWorker(*cfg); err != nil {
