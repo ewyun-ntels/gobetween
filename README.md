@@ -776,3 +776,39 @@ ambient capability를 제거하는 처리를 확인했다. 상용 Red Hat 빌드
 남은 작업은 실제 레지스트리/네임스페이스/백엔드 SRV/대상 노드 값 확정, 비루트 RR 권한 전달 방식과 SCC/ServiceAccount 승인,
 상용 Pod의 기동·Headless discovery·CPU 전용 할당·RR/통신·종료 확인 및 부하 측정이다.
 로컬 Docker 테스트 성공은 OpenShift 운영 인증, 목표 30만 PPS 또는 무손실/무지연 보장을 의미하지 않는다.
+
+## OpenShift root·privileged SCC 프로파일 추가 (2026-10-02)
+
+앞선 비루트 RR 권한 전달 문제에 대한 배포 선택지로 root·privileged 모드를 차트에 추가했다.
+기본 비루트 구성은 유지하며, `charts/gobetween/values-openshift-privileged.yaml`을 명시적으로 적용한다.
+차트 버전은 `0.2.0`이다. Go 애플리케이션 코드와 운영 이미지는 변경하지 않았다.
+
+- 신규 설정: `openshift.privileged`, `openshift.createSCC`, 기존 `openshift.sccName`.
+- 전용 SCC 자동 생성: UID 0 필수, privileged 허용, 초기 user namespace 허용, unconfined seccomp.
+  SCC 이름에는 네임스페이스와 릴리스명을 포함하고 긴 이름은 해시로 축약한다.
+- 해당 네임스페이스의 ServiceAccount 하나에 해당 SCC 하나의 `use`만 Role/RoleBinding으로 부여한다.
+  SCC의 users/groups에 직접 전역 권한을 넣거나 ClusterRoleBinding을 생성하지 않는다.
+- Pod/컨테이너 UID 0, `runAsNonRoot=false`, 컨테이너 `privileged=true`,
+  `allowPrivilegeEscalation=true`를 일관되게 적용하고 RuntimeDefault seccomp 설정을 제거한다.
+  privileged에서는 capability drop/add 블록을 생략한다. BPF 전용 권한보다 훨씬 넓은 권한이다.
+- 읽기 전용 root filesystem/config와 ServiceAccount 토큰 미마운트는 유지한다.
+  host network/PID/IPC/ports/path는 추가하지 않는다.
+- `createSCC=false`와 승인된 `sccName`으로 기존 SCC 재사용도 가능하다.
+  이 경우 SCC 자체는 변경하지 않는다. 기본 제공 SCC를 새로 생성/덮어쓰는 설정은 거부한다.
+- 생성 SCC는 Helm 릴리스 소유이며 uninstall 시 삭제 대상이다. 다른 릴리스/워크로드에 공유하지 않는다.
+  실제 설치자는 SCC 생성과 SCC 사용 권한 연결이 가능한 관리자 승인 권한이 필요하다.
+
+```sh
+# 로컬 검증/렌더링. 실제 클러스터 적용은 수행하지 않았다.
+make chart-lint chart-test
+helm template udp-proxy charts/gobetween -n target-namespace \
+  -f charts/gobetween/values-openshift-privileged.yaml -f values-prod.yaml
+```
+
+WSL Helm 3.17.0에서 기본/privileged 두 프로파일의 strict lint와 차트 회귀 시험 28개가 통과했다.
+전용 SCC/SA 권한 범위, UID 0/privileged 설정, 기존 SCC 재사용, 긴 이름/네임스페이스별 이름 분리,
+기본 설정 보존 및 잘못된 권한 조합 거부를 검증했다.
+root/src 두 Go 모듈 전체의 `make test-race vet`도 통과했고,
+로컬 차트 패키지 `bin/gobetween-0.2.0.tgz`를 생성했다.
+이는 로컬 템플릿 검증이며 실제 OpenShift admission, SCC 선택, CPU 전용 할당, RR 통신 및 부하 검증은 남아 있다.
+이 작업에서 상용 클러스터 적용, SCC/RBAC 변경, 이미지 push는 수행하지 않았다.

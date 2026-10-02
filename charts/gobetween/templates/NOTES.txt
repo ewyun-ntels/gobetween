@@ -1,9 +1,16 @@
 UDP-only configuration prepared for {{ include "gobetween.fullname" . }}.
 Workers: {{ .Values.runtime.workerProcesses }}; CPU policy: {{ .Values.runtime.workerCPUPolicy }}.
 API and profiler are absent/disabled. No backend Headless Service is created.
+{{ if .Values.openshift.privileged }}
+WARNING: explicitly opted into UID 0 + privileged (all capabilities; seccomp unconfined).
+SCC: {{ include "gobetween.sccName" . }}; SA: {{ include "gobetween.serviceAccountName" . }}; namespace: {{ .Release.Namespace }}.
+{{ if .Values.openshift.createSCC }}A dedicated cluster-scoped SCC will be created. Administrator approval/installation permissions are required.{{ else }}The existing SCC is not modified; it must permit root/privileged execution.{{ end }}
+No production-cluster validation is implied by successful Helm rendering.
+{{ else }}
 {{ if include "gobetween.needsBPF" . }}
 RR requires CAP_BPF in the initial user namespace and an approved seccomp/SCC policy.
 {{ if not .Values.openshift.sccName }}WARNING: no SCC-use binding is configured. Restricted SCC normally rejects CAP_BPF; approve a dedicated SCC before deployment.{{ end }}
+{{ end }}
 {{ end }}
 Probes only check the parent listener. Pod Ready does NOT certify worker/backend readiness.
 Check gobetween_worker_up, discovered backends and actual UDP forwarding after deployment.

@@ -1,0 +1,8 @@
+# Explicit root/privileged OpenShift profile. Administrator approval required.
+# Creates a dedicated SCC and grants only this release's ServiceAccount its use.
+# Do not combine with an existing SCC name unless you also set createSCC=false.
+openshift:
+  privileged: true
+  createSCC: true
+  sccName: ""
+hostUsers: true

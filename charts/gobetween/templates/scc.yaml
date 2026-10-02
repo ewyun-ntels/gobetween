@@ -1,0 +1,43 @@
+{{- if .Values.openshift.createSCC }}
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: {{ include "gobetween.sccName" . }}
+  labels:
+    {{- include "gobetween.labels" . | nindent 4 }}
+  annotations:
+    kubernetes.io/description: "Dedicated gobetween root/privileged SCC; use is scoped by release namespace RBAC."
+# Privileged grants all capabilities. Host mounts/namespaces/ports are NOT requested.
+allowPrivilegedContainer: true
+allowPrivilegeEscalation: true
+defaultAllowPrivilegeEscalation: true
+allowHostDirVolumePlugin: false
+allowHostIPC: false
+allowHostNetwork: false
+allowHostPID: false
+allowHostPorts: false
+readOnlyRootFilesystem: true
+userNamespaceLevel: AllowHostLevel
+allowedCapabilities: ["*"]
+requiredDropCapabilities: []
+defaultAddCapabilities: []
+runAsUser:
+  type: MustRunAs
+  uid: 0
+seLinuxContext:
+  type: RunAsAny
+fsGroup:
+  type: MustRunAs
+supplementalGroups:
+  type: RunAsAny
+seccompProfiles:
+  - unconfined
+volumes:
+  - configMap
+  - projected
+  - secret
+  - downwardAPI
+# Do not grant access to broad users/groups; RoleBinding targets only one SA.
+users: []
+groups: []
+{{- end }}

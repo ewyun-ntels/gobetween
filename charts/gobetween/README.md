@@ -2,7 +2,8 @@
 
 상태: 로컬 렌더링·설정 검증 완료. 상용 OpenShift의 admission, CPU 전용 할당,
 비루트 BPF capability 전달, seccomp/SELinux 및 실제 Headless discovery는 아직 미검증이다.
-기본값의 `rr`은 관리자 승인과 실제 권한 검증 없이 배포 준비 완료를 의미하지 않는다.
+root·privileged 실행은 `values-openshift-privileged.yaml`로 명시적으로 선택할 수 있다.
+기본 비루트 설정은 유지하며, 어느 모드든 실제 OpenShift 기동/통신 확인은 별도로 필요하다.
 
 ## 기본 구성
 
@@ -14,7 +15,8 @@
 - 임의 UID, 읽기 전용 root filesystem/config, stdout 로그, pidfile 없음.
 - RR + 워커 2개 이상만 `BPF` 요청. hash 및 RR 1워커는 추가 capability 없이 실행.
 - ServiceAccount 토큰은 마운트하지 않음. 승인된 `openshift.sccName`을 지정할 때만
-  그 SCC 하나의 `use` 권한을 해당 네임스페이스 SA에 연결하는 Role/RoleBinding 생성.
+  (또는 `openshift.createSCC: true`로 전용 SCC를 만들 때) 그 SCC 하나의 `use` 권한을
+  해당 네임스페이스 SA에 연결하는 Role/RoleBinding 생성.
 - 설정 변경은 checksum으로 Pod 재기동. 기본 Recreate 업데이트에는 통신 중단이 있으며
   진행 중인 UDP 패킷/세션 보존을 보장하지 않음.
 
@@ -27,7 +29,7 @@ physical 모드에서 불완전한 SMT 그룹 또는 부족한 물리 코어는 
 
 ## 배포 전 값 준비
 
-별도 `values-prod.yaml`에 아래와 같이 실제 값을 기입한다. 레지스트리·네임스페이스·노드·SCC
+별도 `values-prod.yaml`에 아래와 같이 실제 값을 기입한다. 레지스트리·네임스페이스·노드
 이름은 예시이므로 실제 환경 값으로 교체해야 한다. 이 문서의 명령은 이번 개발에서 배포를 실행한 기록이 아니다.
 
 ```yaml
@@ -41,8 +43,6 @@ discovery:
 nodeSelector:
   kubernetes.io/os: linux
   kubernetes.io/hostname: validated-worker-node
-openshift:
-  sccName: gobetween-udp-rr
 ```
 
 이 설정은 `_backend._udp.udp-backend-headless.backend-namespace.svc.cluster.local.`을 조회한다.
@@ -63,8 +63,65 @@ ServiceMonitor/NetworkPolicy는 자동 생성하지 않는다. hash 권한 최�
 
 ## RR 권한: 반드시 확인할 사항
 
+### root·privileged 모드와 SCC 사용 권한
+
+승인된 root·privileged 실행을 사용할 경우 아래 파일을 추가한다.
+
+```sh
+# 로컬 렌더링만 수행. 실제 배포 명령이 아님.
+helm template udp-proxy charts/gobetween -n target-namespace \
+  -f charts/gobetween/values-openshift-privileged.yaml -f values-prod.yaml
+```
+
+이 프로파일의 설정은 다음과 같다.
+
+```yaml
+openshift:
+  privileged: true
+  createSCC: true
+  sccName: ""  # 비우면 네임스페이스·릴리스명을 포함하여 자동 생성
+hostUsers: true
+```
+
+- Pod/컨테이너의 `runAsUser: 0`, `runAsNonRoot: false`, 컨테이너의 `privileged: true`,
+  `allowPrivilegeEscalation: true`를 함께 적용하고 기존 seccompProfile을 제거한다.
+- RR 부모와 자식은 별도 launcher 없이 운영 이미지의 `/gobetween`으로 실행한다.
+  비루트 capability 전달에 의존하지 않으며, privileged는 BPF만이 아니라 모든 capability를 부여한다.
+- root filesystem/config의 읽기 전용 설정과 토큰 미마운트는 유지한다.
+  hostNetwork/hostPID/hostIPC/hostPort/hostPath는 활성화하지 않는다.
+- 전용 SCC는 UID 0과 privileged를 허용하고 `userNamespaceLevel: AllowHostLevel`,
+  `seccompProfiles: [unconfined]`를 사용한다. users/groups 전체에 직접 권한을 주지 않는다.
+- Role/RoleBinding은 이 네임스페이스의 해당 ServiceAccount 하나에 해당 SCC 하나의 `use`만 연결한다.
+  ClusterRole/ClusterRoleBinding 또는 공용 SCC 변경은 없다.
+- 기본 SCC 이름은 `<namespace>-<release>-gobetween-privileged`이며 긴 이름은 해시로 축약한다.
+  SCC는 클러스터 범위 리소스이므로 다른 릴리스와 명시적 `sccName`을 공유하지 않는다.
+
+SCC를 생성하고 그 사용 권한을 연결할 수 있는 **관리자 승인 계정**으로 설치해야 한다.
+차트가 설치자 자신의 권한을 올리지는 않는다. 이 프로파일이 생성한 SCC는 Helm 릴리스 소유이며
+uninstall 시 삭제 대상이다. 다른 워크로드에 공유하지 않는다.
+
+이미 승인된 root·privileged SCC를 재사용하려면 `values-prod.yaml`에서 아래처럼 덮어쓴다.
+
+```yaml
+openshift:
+  privileged: true
+  createSCC: false
+  sccName: approved-existing-privileged-scc
+```
+
+이 경우 SCC 자체는 생성/수정/삭제하지 않고 SA의 사용 권한만 연결한다.
+기존 `privileged` SCC를 참조하는 것도 가능하지만 기본 제공 SCC 이름으로 새 SCC를 만들거나
+덮어쓰려 하면 렌더링을 거부한다. 선택한 기존 SCC가 실제 UID 0/privileged/hostUsers 등을
+허용하는지는 관리자가 확인해야 한다. 별도 PSA/Admission 정책에 의한 거부도 차트가 우회하지 않는다.
+
+privileged는 seccomp 등 격리 제약을 크게 완화하므로 이 모드는 운영 보안 승인이 전제다.
+[Kubernetes privileged 설명](https://kubernetes.io/docs/concepts/security/linux-kernel-security-constraints/#privileged-containers).
+실제 OpenShift admission/SCC 선택, CPU 전용 할당, Headless discovery, RR 통신, 종료 및 부하는 아직 미검증이다.
+
+### 기본 비루트 RR 모드의 제한
+
 `admin/scc-rr-example.yaml`은 관리자 검토용 초안이며 Helm이 자동 적용하지 않는다.
-기본 restricted SCC를 수정하거나 privileged/SYS_ADMIN을 자동 부여하지 않는다.
+기본 설정에서는 restricted SCC를 수정하거나 privileged/SYS_ADMIN을 자동 부여하지 않는다.
 SCC 생성과 `use` RoleBinding 생성 권한은 실제 실행 계정에 따라 별도 승인이 필요하다.
 
 RR 부모는 초기 user namespace의 BPF 권한이 필요하므로 `hostUsers: true`를 사용한다.
@@ -85,7 +142,7 @@ ambient capability를 제거하는 처리를 확인했다. 상용 Red Hat 빌드
 필요하다면 권한 있는 별도 BPF loader 또는 승인된 제한적 기동 방식 등을 후속 설계해야 한다.
 이번 작업에서 운영용 권한 상승 wrapper를 추가하지 않았다.
 
-seccomp는 RuntimeDefault를 기본으로 사용한다. 대상 CRI-O 기본 프로파일에서 필요한 BPF syscall이
+비루트 모드의 seccomp는 RuntimeDefault를 기본으로 사용한다. 대상 CRI-O 기본 프로파일에서 필요한 BPF syscall이
 차단될 경우 관리자 승인된 Localhost 프로파일 등의 대안을 검토한다. 자동 Unconfined 변경은 하지 않는다.
 실제 memlock 오류가 발생하면 커널의 memcg BPF accounting과 RLIMIT_MEMLOCK을 먼저 확인한다.
 SYS_RESOURCE를 무조건 추가하지 않는다. 상용 SELinux 정책도 별도로 확인한다.

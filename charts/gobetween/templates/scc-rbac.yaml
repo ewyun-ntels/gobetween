@@ -1,20 +1,23 @@
-{{- if .Values.openshift.sccName }}
+{{- $sccName := include "gobetween.sccName" . -}}
+{{- if $sccName }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: {{ include "gobetween.fullname" . }}-scc
+  namespace: {{ .Release.Namespace }}
   labels:
     {{- include "gobetween.labels" . | nindent 4 }}
 rules:
   - apiGroups: ["security.openshift.io"]
     resources: ["securitycontextconstraints"]
-    resourceNames: [{{ .Values.openshift.sccName | quote }}]
+    resourceNames: [{{ $sccName | quote }}]
     verbs: ["use"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: {{ include "gobetween.fullname" . }}-scc
+  namespace: {{ .Release.Namespace }}
   labels:
     {{- include "gobetween.labels" . | nindent 4 }}
 roleRef:

@@ -17,8 +17,10 @@ import (
 type chartResource struct {
 	Kind     string `yaml:"kind"`
 	Metadata struct {
-		Name string `yaml:"name"`
+		Name      string `yaml:"name"`
+		Namespace string `yaml:"namespace"`
 	} `yaml:"metadata"`
+	Extra map[string]interface{} `yaml:",inline"`
 	Data  map[string]string      `yaml:"data"`
 	Spec  map[string]interface{} `yaml:"spec"`
 	Rules []struct {
@@ -29,12 +31,17 @@ type chartResource struct {
 }
 
 func renderChart(t *testing.T, overrides ...string) ([]chartResource, string) {
+	return renderChartOptions(t, nil, overrides...)
+}
+
+func renderChartOptions(t *testing.T, options []string, overrides ...string) ([]chartResource, string) {
 	t.Helper()
 	chart, err := filepath.Abs("../charts/gobetween")
 	if err != nil {
 		t.Fatal(err)
 	}
 	args := []string{"template", "udp-test", chart, "--namespace", "test-namespace"}
+	args = append(args, options...)
 	for _, value := range overrides {
 		args = append(args, "--set", value)
 	}
@@ -158,6 +165,109 @@ func TestHelmChart(t *testing.T) {
 			t.Fatal("SRV override ignored")
 		}
 	})
+	t.Run("privileged_profile_scoped_scc", func(t *testing.T) {
+		resources, _ := renderChartOptions(t, []string{"-f", "../charts/gobetween/values-openshift-privileged.yaml"})
+		chartConfig(t, resources)
+		sccName := "test-namespace-udp-test-gobetween-privileged"
+		counts := map[string]int{}
+		for _, resource := range resources {
+			counts[resource.Kind]++
+			switch resource.Kind {
+			case "SecurityContextConstraints":
+				if resource.Metadata.Name != sccName || resource.Metadata.Namespace != "" || resource.Extra["allowPrivilegedContainer"] != true || resource.Extra["userNamespaceLevel"] != "AllowHostLevel" || resource.Extra["readOnlyRootFilesystem"] != true {
+					t.Fatalf("incorrect dedicated SCC: %+v", resource)
+				}
+				user := resource.Extra["runAsUser"].(map[string]interface{})
+				if user["type"] != "MustRunAs" || user["uid"] != 0 {
+					t.Fatalf("SCC must require UID 0: %v", user)
+				}
+				for _, key := range []string{"allowHostDirVolumePlugin", "allowHostIPC", "allowHostNetwork", "allowHostPID", "allowHostPorts"} {
+					if resource.Extra[key] != false {
+						t.Fatalf("unexpected host access: %s", key)
+					}
+				}
+				for _, key := range []string{"users", "groups"} {
+					if len(resource.Extra[key].([]interface{})) != 0 {
+						t.Fatalf("unexpected global SCC grant: %s", key)
+					}
+				}
+			case "Role":
+				if resource.Metadata.Namespace != "test-namespace" || len(resource.Rules) != 1 || len(resource.Rules[0].ResourceNames) != 1 || resource.Rules[0].ResourceNames[0] != sccName || len(resource.Rules[0].Verbs) != 1 || resource.Rules[0].Verbs[0] != "use" || len(resource.Rules[0].Resources) != 1 || resource.Rules[0].Resources[0] != "securitycontextconstraints" {
+					t.Fatalf("overbroad SCC role: %+v", resource)
+				}
+			case "RoleBinding":
+				subjects := resource.Extra["subjects"].([]interface{})
+				if resource.Metadata.Namespace != "test-namespace" || len(subjects) != 1 {
+					t.Fatal("binding must target exactly one namespace SA")
+				}
+				subject := subjects[0].(map[string]interface{})
+				if subject["kind"] != "ServiceAccount" || subject["name"] != "udp-test-gobetween" || subject["namespace"] != "test-namespace" {
+					t.Fatalf("incorrect SCC subject: %v", subject)
+				}
+			case "Deployment":
+				pod := resource.Spec["template"].(map[string]interface{})["spec"].(map[string]interface{})
+				container := pod["containers"].([]interface{})[0].(map[string]interface{})
+				for _, sc := range []map[string]interface{}{pod["securityContext"].(map[string]interface{}), container["securityContext"].(map[string]interface{})} {
+					if sc["runAsUser"] != 0 || sc["runAsNonRoot"] != false || sc["seccompProfile"] != nil {
+						t.Fatalf("inconsistent privileged context: %v", sc)
+					}
+				}
+				sc := container["securityContext"].(map[string]interface{})
+				if sc["privileged"] != true || sc["allowPrivilegeEscalation"] != true || sc["readOnlyRootFilesystem"] != true || sc["capabilities"] != nil || pod["hostUsers"] != true {
+					t.Fatalf("incorrect privileged container: %v", sc)
+				}
+			}
+		}
+		if counts["SecurityContextConstraints"] != 1 || counts["Role"] != 1 || counts["RoleBinding"] != 1 || counts["Deployment"] != 1 || counts["ClusterRole"] != 0 || counts["ClusterRoleBinding"] != 0 {
+			t.Fatalf("incorrect resource scope: %v", counts)
+		}
+	})
+	t.Run("privileged_existing_scc", func(t *testing.T) {
+		resources, output := renderChart(t, "openshift.privileged=true", "openshift.sccName=privileged", "serviceAccount.create=false", "serviceAccount.name=existing-sa")
+		for _, resource := range resources {
+			if resource.Kind == "SecurityContextConstraints" || resource.Kind == "ServiceAccount" {
+				t.Fatal("existing SCC/SA must not be created or overwritten")
+			}
+		}
+		if !strings.Contains(output, "privileged: true") || !strings.Contains(output, `resourceNames: ["privileged"]`) || !strings.Contains(output, "serviceAccountName: existing-sa") {
+			t.Fatal("existing SCC mode not applied")
+		}
+	})
+	t.Run("generated_scc_name_is_namespace_scoped_and_bounded", func(t *testing.T) {
+		var names []string
+		for _, namespace := range []string{strings.Repeat("a", 63), strings.Repeat("b", 63)} {
+			resources, _ := renderChartOptions(t, []string{"--namespace", namespace}, "openshift.privileged=true", "openshift.createSCC=true", "fullnameOverride="+strings.Repeat("c", 54))
+			for _, resource := range resources {
+				if resource.Kind == "SecurityContextConstraints" {
+					if len(resource.Metadata.Name) > 63 {
+						t.Fatal("SCC name exceeds DNS label length")
+					}
+					names = append(names, resource.Metadata.Name)
+				}
+			}
+		}
+		if len(names) != 2 || names[0] == names[1] {
+			t.Fatal("SCC names collide across namespaces")
+		}
+	})
+	for _, settings := range [][]string{
+		{"openshift.createSCC=true"},
+		{"openshift.privileged=true"},
+		{"openshift.privileged=true", "openshift.createSCC=true", "hostUsers=false"},
+		{"containerSecurityContext.privileged=true"},
+		{"openshift.privileged=true", "openshift.createSCC=true", "openshift.sccName=privileged"},
+		{"openshift.privileged=true", "openshift.createSCC=true", "openshift.sccName=restricted-v2"},
+	} {
+		t.Run("reject_"+strings.Join(settings, "+"), func(t *testing.T) {
+			args := []string{"template", "udp-test", "../charts/gobetween"}
+			for _, setting := range settings {
+				args = append(args, "--set", setting)
+			}
+			if output, err := exec.Command("helm", args...).CombinedOutput(); err == nil {
+				t.Fatalf("invalid privileged settings accepted: %v\n%s", settings, output)
+			}
+		})
+	}
 	t.Run("response_timeouts_are_server_values", func(t *testing.T) {
 		resources, _ := renderChart(t, "udp.maxRequests=0", "udp.maxResponses=0", "udp.clientIdleTimeout=10s", "udp.backendIdleTimeout=10s")
 		server := chartConfig(t, resources).Servers["udpproxy"]

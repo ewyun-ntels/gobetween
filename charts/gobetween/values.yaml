@@ -53,7 +53,13 @@ serviceAccount:
   name: ""
   annotations: {}
 openshift:
-  # Existing administrator-approved SCC; empty generates no SCC-use RBAC.
+  # Explicit opt-in. Forces UID 0, privileged=true and compatible contexts.
+  privileged: false
+  # Creates a release/namespace-specific privileged SCC, not a built-in SCC.
+  # Requires administrator permissions at install time. No creation by default.
+  createSCC: false
+  # Existing approved SCC, or optional custom name when createSCC=true.
+  # Empty + createSCC=true generates a unique SCC name and its SA-use binding.
   sccName: ""
 # No runAsUser: OpenShift assigns an arbitrary namespace UID.
 podSecurityContext:

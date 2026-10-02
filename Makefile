@@ -136,6 +136,7 @@ image-test:
 
 chart-lint:
 	$(HELM) lint --strict $(CHART)
+	$(HELM) lint --strict $(CHART) -f $(CHART)/values-openshift-privileged.yaml
 
 chart-template:
 	$(HELM) template gobetween $(CHART)

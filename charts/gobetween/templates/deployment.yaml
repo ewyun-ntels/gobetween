@@ -31,14 +31,15 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       securityContext:
-        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+        {{- include "gobetween.podSecurityContext" . | nindent 8 }}
       containers:
         - name: gobetween
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["-c", "/etc/gobetween/conf/gobetween.toml"]
           securityContext:
-            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+            {{- include "gobetween.containerSecurityContext" . | nindent 12 }}
+            {{- if not .Values.openshift.privileged }}
             capabilities:
               drop: ["ALL"]
               {{- $caps := .Values.extraCapabilities -}}
@@ -48,6 +49,7 @@ spec:
               {{- if $caps }}
               add: {{ $caps | uniq | toJson }}
               {{- end }}
+            {{- end }}
           ports:
             - name: udp
               containerPort: {{ .Values.udp.port }}
