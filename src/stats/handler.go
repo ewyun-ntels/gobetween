@@ -50,7 +50,9 @@ type Handler struct {
 	Backends chan []core.Backend
 
 	/* Channel for indicating stop request */
-	stopChan chan bool
+	stopChan chan struct{}
+	done     chan struct{}
+	stopOnce sync.Once
 
 	/* Input channel for latest stats */
 	ServerStats chan counters.BandwidthStats
@@ -68,7 +70,8 @@ func NewHandler(name string) *Handler {
 		Traffic:     make(chan core.ReadWriteCount),
 		Connections: make(chan uint),
 		Backends:    make(chan []core.Backend),
-		stopChan:    make(chan bool),
+		stopChan:    make(chan struct{}),
+		done:        make(chan struct{}),
 		latestStats: Stats{
 			RxTotal:  0,
 			TxTotal:  0,
@@ -97,13 +100,17 @@ func (this *Handler) Start() {
 	this.BackendsCounter.Start()
 
 	go func() {
+		defer close(this.done)
+		var forwarding sync.WaitGroup
 
 		for {
 			select {
 
 			/* stop stats processor requested */
 			case <-this.stopChan:
-
+				// No new forwarding goroutines can be added after this point.
+				// Their sends are cancellable; wait before stopping the counters.
+				forwarding.Wait()
 				this.serverCounter.Stop()
 				this.BackendsCounter.Stop()
 
@@ -111,10 +118,7 @@ func (this *Handler) Start() {
 				delete(Store.handlers, this.Name)
 				Store.Unlock()
 
-				// close channels
-				close(this.ServerStats)
-				close(this.Traffic)
-				close(this.Connections)
+				// Input channels belong to producers; do not close them here.
 				return
 
 			/* New server stats available */
@@ -145,10 +149,19 @@ func (this *Handler) Start() {
 			/* New traffic stats available */
 			case rwc := <-this.Traffic:
 				// forward to counters
-				go func() {
-					this.serverCounter.Traffic <- rwc
-					this.BackendsCounter.Traffic <- rwc
-				}()
+				forwarding.Add(1)
+				go func(rwc core.ReadWriteCount) {
+					defer forwarding.Done()
+					select {
+					case this.serverCounter.Traffic <- rwc:
+					case <-this.stopChan:
+						return
+					}
+					select {
+					case this.BackendsCounter.Traffic <- rwc:
+					case <-this.stopChan:
+					}
+				}(rwc)
 			}
 		}
 	}()
@@ -171,5 +184,6 @@ func (this *Handler) Snapshot() Stats {
  * Request handler stop and clear resources
  */
 func (this *Handler) Stop() {
-	this.stopChan <- true
+	this.stopOnce.Do(func() { close(this.stopChan) })
+	<-this.done
 }

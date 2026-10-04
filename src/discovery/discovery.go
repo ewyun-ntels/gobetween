@@ -9,6 +9,7 @@ package discovery
 import (
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/yyyar/gobetween/config"
@@ -87,7 +88,8 @@ type Discovery struct {
 	/**
 	 * Channel for stopping discovery
 	 */
-	stop chan bool
+	stop     chan struct{}
+	stopOnce sync.Once
 }
 
 /**
@@ -98,7 +100,7 @@ func (this *Discovery) Start() {
 	log := logging.For("discovery")
 
 	this.out = make(chan []core.Backend)
-	this.stop = make(chan bool)
+	this.stop = make(chan struct{})
 
 	// Prepare interval
 	interval, err := time.ParseDuration(this.cfg.Interval)
@@ -175,8 +177,7 @@ func (this *Discovery) send() bool {
 	select {
 	case <-this.stop:
 		return false
-	default:
-		this.out <- *this.backends
+	case this.out <- *this.backends:
 		return true
 	}
 }
@@ -189,15 +190,13 @@ func (this *Discovery) send() bool {
 func (this *Discovery) wait(interval time.Duration) bool {
 
 	t := time.NewTimer(interval)
+	defer t.Stop()
 
 	select {
 	case <-t.C:
 		return true
 
 	case <-this.stop:
-		if !t.Stop() {
-			<-t.C
-		}
 		return false
 	}
 
@@ -207,7 +206,9 @@ func (this *Discovery) wait(interval time.Duration) bool {
  * Stop discovery
  */
 func (this *Discovery) Stop() {
-	this.stop <- true
+	// Static discovery may already have returned. Broadcast cancellation
+	// also releases an update blocked on a scheduler that has stopped.
+	this.stopOnce.Do(func() { close(this.stop) })
 }
 
 /**

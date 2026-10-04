@@ -54,9 +54,11 @@ type Server struct {
 	stopped uint32
 
 	/* Stop lifecycle */
-	stop     chan struct{}
-	done     chan struct{}
-	stopOnce sync.Once
+	stop      chan struct{}
+	done      chan struct{}
+	serveDone chan struct{}
+	pool      *connPool
+	stopOnce  sync.Once
 
 	/* ----- modules ----- */
 
@@ -99,6 +101,11 @@ func (cp *connPool) put(addr string, conn net.Conn) {
 
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
+	if cp.pool == nil {
+		// Shutdown may race with a backend dial already in flight.
+		conn.Close()
+		return
+	}
 	cp.pool[addr] = conn
 }
 
@@ -136,6 +143,7 @@ func New(name string, cfg config.Server) (*Server, error) {
 		scheduler: scheduler,
 		stop:      make(chan struct{}),
 		done:      make(chan struct{}),
+		serveDone: make(chan struct{}),
 		sessions:  make(map[string]*session.Session),
 	}
 
@@ -190,16 +198,20 @@ func (this *Server) Start() error {
 				ticker.Stop()
 
 				this.serverConn.Close()
-
-				this.scheduler.StatsHandler.Stop()
+				this.pool.close()
+				// Cancel scheduler requests before joining I/O producers. Keep
+				// statistics alive until no producer can write to its channels.
 				this.scheduler.Stop()
+				<-this.serveDone
 
 				this.mu.Lock()
 				for k, s := range this.sessions {
 					delete(this.sessions, k)
 					s.Close()
+					s.Wait()
 				}
 				this.mu.Unlock()
+				this.scheduler.StatsHandler.Stop()
 
 				return
 			}
@@ -259,10 +271,11 @@ func (this *Server) serve() {
 	if cfg.MaxRequests == 1 {
 		cp = newConnPool()
 	}
+	this.pool = cp
 
 	// Main loop goroutine - reads incoming data and decides what to do
 	go func() {
-
+		defer close(this.serveDone)
 		defer cp.close()
 
 		buf := make([]byte, UDP_PACKET_SIZE)
@@ -312,6 +325,7 @@ func (this *Server) cleanup() {
 
 	for k, s := range this.sessions {
 		if s.IsDone() {
+			s.Wait()
 			delete(this.sessions, k)
 		}
 
@@ -382,7 +396,8 @@ func (this *Server) getOrCreateSession(cfg session.Config, clientAddr *net.UDPAd
 
 	//session exists but should be replaced with a new one
 	if ok {
-		go func() { s.Close() }()
+		s.Close()
+		s.Wait()
 	}
 
 	conn, backend, err := this.electAndConnect(nil, clientAddr)

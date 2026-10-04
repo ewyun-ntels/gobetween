@@ -7,6 +7,7 @@ package counters
  */
 
 import (
+	"sync"
 	"time"
 
 	"github.com/yyyar/gobetween/core"
@@ -39,7 +40,9 @@ type BandwidthCounter struct {
 	Traffic chan core.ReadWriteCount
 
 	/* Stop channel */
-	stop chan bool
+	stop     chan struct{}
+	done     chan struct{}
+	stopOnce sync.Once
 
 	/* Output channel for bandwidth stats */
 	Out chan BandwidthStats
@@ -61,7 +64,8 @@ func NewBandwidthCounter(interval time.Duration, out chan BandwidthStats) *Bandw
 		RxTotalLast: 0,
 		Out:         out,
 		Traffic:     make(chan core.ReadWriteCount),
-		stop:        make(chan bool),
+		stop:        make(chan struct{}),
+		done:        make(chan struct{}),
 	}
 }
 
@@ -71,14 +75,14 @@ func NewBandwidthCounter(interval time.Duration, out chan BandwidthStats) *Bandw
 func (this *BandwidthCounter) Start() {
 
 	go func() {
+		defer close(this.done)
+		defer this.ticker.Stop()
 
 		for {
 			select {
 
 			// Stop requested
 			case <-this.stop:
-				this.ticker.Stop()
-				close(this.Traffic)
 				return
 
 				// New counting cycle
@@ -102,7 +106,11 @@ func (this *BandwidthCounter) Start() {
 				}
 
 				// Send results to out
-				this.Out <- this.BandwidthStats
+				select {
+				case this.Out <- this.BandwidthStats:
+				case <-this.stop:
+					return
+				}
 
 				// New traffic deltas available
 			case rwc := <-this.Traffic:
@@ -118,5 +126,6 @@ func (this *BandwidthCounter) Start() {
  * Stops bandwidth counter
  */
 func (this *BandwidthCounter) Stop() {
-	this.stop <- true
+	this.stopOnce.Do(func() { close(this.stop) })
+	<-this.done
 }

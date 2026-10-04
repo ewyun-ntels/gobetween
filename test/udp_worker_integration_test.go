@@ -207,6 +207,10 @@ func startProxy(t *testing.T, binary, configuration string) (*exec.Cmd, *proxyLo
 			if strings.Contains(log.String(), "Force killing worker") {
 				t.Errorf("worker graceful shutdown timed out\n%s", log.String())
 			}
+			// The supervisor can exit successfully even when a child panics.
+			if strings.Contains(log.String(), "panic:") || strings.Contains(log.String(), "DATA RACE") {
+				t.Errorf("worker failed during integration test\n%s", log.String())
+			}
 		case <-time.After(8 * time.Second):
 			_ = command.Process.Kill()
 			<-done

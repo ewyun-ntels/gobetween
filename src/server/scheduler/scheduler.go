@@ -8,6 +8,7 @@ package scheduler
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/yyyar/gobetween/core"
@@ -81,7 +82,9 @@ type Scheduler struct {
 	ops chan Op
 
 	/* Stop channel */
-	stop chan bool
+	stop     chan struct{}
+	done     chan struct{}
+	stopOnce sync.Once
 
 	/* Elect backend channel */
 	elect chan ElectRequest
@@ -98,7 +101,8 @@ func (this *Scheduler) Start() {
 
 	this.ops = make(chan Op)
 	this.elect = make(chan ElectRequest)
-	this.stop = make(chan bool)
+	this.stop = make(chan struct{})
+	this.done = make(chan struct{})
 	this.backends = make(map[core.Target]*core.Backend)
 
 	this.Discovery.Start()
@@ -111,6 +115,14 @@ func (this *Scheduler) Start() {
 	 * Goroutine updates and manages backends
 	 */
 	go func() {
+		defer close(this.done)
+		defer func() {
+			log.Info("Stopping scheduler ", this.StatsHandler.Name)
+			backendsPushTicker.Stop()
+			this.Discovery.Stop()
+			this.Healthcheck.Stop()
+			metrics.RemoveServer(this.StatsHandler.Name, this.backends)
+		}()
 		for {
 			select {
 
@@ -119,8 +131,16 @@ func (this *Scheduler) Start() {
 			// handle newly discovered backends
 			case backends := <-this.Discovery.Discover():
 				this.HandleBackendsUpdate(backends)
-				this.Healthcheck.In <- this.Targets()
-				this.StatsHandler.BackendsCounter.In <- this.Targets()
+				select {
+				case this.Healthcheck.In <- this.Targets():
+				case <-this.stop:
+					return
+				}
+				select {
+				case this.StatsHandler.BackendsCounter.In <- this.Targets():
+				case <-this.stop:
+					return
+				}
 
 			/* ------ healthcheck ----- */
 
@@ -132,7 +152,11 @@ func (this *Scheduler) Start() {
 
 			// push current backends to stats handler
 			case <-backendsPushTicker.C:
-				this.StatsHandler.Backends <- this.Backends()
+				select {
+				case this.StatsHandler.Backends <- this.Backends():
+				case <-this.stop:
+					return
+				}
 
 			// handle new bandwidth stats of a backend
 			case bs := <-this.StatsHandler.BackendsCounter.Out:
@@ -152,11 +176,6 @@ func (this *Scheduler) Start() {
 
 			// handle scheduler stop
 			case <-this.stop:
-				log.Info("Stopping scheduler ", this.StatsHandler.Name)
-				backendsPushTicker.Stop()
-				this.Discovery.Stop()
-				this.Healthcheck.Stop()
-				metrics.RemoveServer(fmt.Sprintf("%s", this.StatsHandler.Name), this.backends)
 				return
 			}
 		}
@@ -303,10 +322,16 @@ func (this *Scheduler) HandleOp(op Op) {
 	// backend for this count may be out of discovery pool
 	switch op.op {
 	case IncrementTx:
-		this.StatsHandler.Traffic <- core.ReadWriteCount{CountWrite: op.param.(uint), Target: op.target}
+		select {
+		case this.StatsHandler.Traffic <- core.ReadWriteCount{CountWrite: op.param.(uint), Target: op.target}:
+		case <-this.stop:
+		}
 		return
 	case IncrementRx:
-		this.StatsHandler.Traffic <- core.ReadWriteCount{CountRead: op.param.(uint), Target: op.target}
+		select {
+		case this.StatsHandler.Traffic <- core.ReadWriteCount{CountRead: op.param.(uint), Target: op.target}:
+		case <-this.stop:
+		}
 		return
 	}
 
@@ -337,16 +362,25 @@ func (this *Scheduler) HandleOp(op Op) {
  * Stop scheduler
  */
 func (this *Scheduler) Stop() {
-	this.stop <- true
+	this.stopOnce.Do(func() { close(this.stop) })
+	<-this.done
 }
 
 /**
  * Take elect backend for proxying
  */
 func (this *Scheduler) TakeBackend(context core.Context) (*core.Backend, error) {
-	r := ElectRequest{context, make(chan core.Backend), make(chan error)}
-	this.elect <- r
+	// Buffered replies let the scheduler finish an election if the caller
+	// observes shutdown before receiving the result.
+	r := ElectRequest{context, make(chan core.Backend, 1), make(chan error, 1)}
 	select {
+	case this.elect <- r:
+	case <-this.stop:
+		return nil, fmt.Errorf("scheduler stopped")
+	}
+	select {
+	case <-this.stop:
+		return nil, fmt.Errorf("scheduler stopped")
 	case err := <-r.Err:
 		return nil, err
 	case backend := <-r.Response:
@@ -358,33 +392,40 @@ func (this *Scheduler) TakeBackend(context core.Context) (*core.Backend, error) 
  * Increment connection refused count for backend
  */
 func (this *Scheduler) IncrementRefused(backend core.Backend) {
-	this.ops <- Op{backend.Target, IncrementRefused, nil}
+	this.submit(Op{backend.Target, IncrementRefused, nil})
 }
 
 /**
  * Increment backend connection counter
  */
 func (this *Scheduler) IncrementConnection(backend core.Backend) {
-	this.ops <- Op{backend.Target, IncrementConnection, nil}
+	this.submit(Op{backend.Target, IncrementConnection, nil})
 }
 
 /**
  * Decrement backends connection counter
  */
 func (this *Scheduler) DecrementConnection(backend core.Backend) {
-	this.ops <- Op{backend.Target, DecrementConnection, nil}
+	this.submit(Op{backend.Target, DecrementConnection, nil})
 }
 
 /**
  * Increment Rx stats for backend
  */
 func (this *Scheduler) IncrementRx(backend core.Backend, c uint) {
-	this.ops <- Op{backend.Target, IncrementRx, c}
+	this.submit(Op{backend.Target, IncrementRx, c})
 }
 
 /**
  * Increment Tx stats for backends
  */
 func (this *Scheduler) IncrementTx(backend core.Backend, c uint) {
-	this.ops <- Op{backend.Target, IncrementTx, c}
+	this.submit(Op{backend.Target, IncrementTx, c})
+}
+
+func (this *Scheduler) submit(op Op) {
+	select {
+	case this.ops <- op:
+	case <-this.stop:
+	}
 }

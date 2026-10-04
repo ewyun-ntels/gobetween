@@ -812,3 +812,54 @@ root/src 두 Go 모듈 전체의 `make test-race vet`도 통과했고,
 로컬 차트 패키지 `bin/gobetween-0.2.0.tgz`를 생성했다.
 이는 로컬 템플릿 검증이며 실제 OpenShift admission, SCC 선택, CPU 전용 할당, RR 통신 및 부하 검증은 남아 있다.
 이 작업에서 상용 클러스터 적용, SCC/RBAC 변경, 이미지 push는 수행하지 않았다.
+
+## Enhancement 소스 검증 후 안정성 수정 (2026-10-05)
+
+소스 검증에서 재현한 워커 생명주기, DNS 실패 처리, 트래픽 중 종료 문제를 수정했다.
+기존 `hash`/`rr`, `logical`/`physical` 설정은 유지하며 추가 설정은 필요하지 않다.
+
+- **종료한 워커의 지연 IPC 메시지 무시**: IPC reader와 프로세스 Wait의 이벤트 도착 순서가
+  뒤바뀌어도 종료/연결 해제된 워커의 `ready`, heartbeat, stats를 처리하지 않는다.
+  이미 제거한 RR listener를 다시 활성화하려다 supervisor 전체가 종료되는 문제를 막는다.
+  재시작 시 연결 상태를 초기화하며, 기존 generation 검사도 유지한다.
+- **Headless SRV discovery 실패 정책 보완**: DNS `SERVFAIL`, `REFUSED` 등의 오류 응답은
+  성공한 빈 목록으로 처리하지 않고 다음 nameserver를 시도한 뒤 실패 정책에 전달한다.
+  SRV 대상의 후속 A/AAAA 조회에서도 주소를 얻지 못하고 조회 오류가 발생하면 실패로 전달한다.
+  `keeplast`는 직전 목록을 유지하고 `setempty`는 빈 목록을 적용한다.
+  정상적인 빈 응답과 `NXDOMAIN`은 기존처럼 성공한 빈 discovery로 처리한다.
+- **UDP 종료 경합 수정**: 수신 소켓·송신 풀을 닫고 scheduler 요청을 취소한 뒤 수신 루프와
+  세션 고루틴 종료를 기다리고, 마지막에 통계 처리를 종료한다.
+  통계 forwarding 고루틴과 counter 출력 대기는 취소 가능하게 하고 종료 완료를 확인한다.
+  수신 측에서 입력 채널을 닫아 발생하던 `send on closed channel` panic/data race를 제거했다.
+  static discovery 완료 후 Stop 대기, discovery/healthcheck의 출력 대기도 함께 보완했다.
+  세션 Close는 소켓 I/O를 중단하며 종료 후 패킷이 큐에 추가되는 경합을 막는다.
+
+이번 변경은 안전한 종료를 위한 취소/정리 처리다. 종료 시 대기 중인 패킷·통계 이벤트까지
+모두 전달하는 drain 보장은 추가하지 않았고, batch I/O나 PPS 최적화도 포함하지 않았다.
+공유 scheduler/discovery/stats 코드가 변경되었으나 실제 통신 통합 검증의 대상은 UDP다.
+
+검증 결과:
+
+- WSL에서 root/src 두 Go 모듈의 `make test-race vet` 통과.
+- 기본/privileged 차트의 `make chart-lint` 통과.
+- 지연 IPC 메시지, DNS 응답 코드와 `keeplast`/`setempty`, static discovery 종료,
+  통계 forwarding 및 출력 대기 중 종료 회귀 테스트 추가.
+- race 바이너리로 트래픽 중 SIGTERM 종료 **12개** 통과:
+  `hash`/`rr` × 단방향(`max_requests=1`)/응답형(`max_requests=0`) × 각 3회.
+  종료 완료까지 트래픽을 유지하고 자식 프로세스 로그의 panic/data race와 강제 종료를 검사했다.
+- 기존 워커 통합 시험 **7개** 통과: RR/hash 통신, 요청·응답, 워커 재시작,
+  logical/physical CPU 배치 및 실제 자식 스레드 affinity 확인.
+- WSL root 권한으로 실제 커널 BPF RR 시험 통과. 이 실행에서 비권한 오류 시험은
+  root이므로 skip되며, 일반 사용자 전체 테스트에서는 해당 경로를 별도로 실행한다.
+
+프로세스 통합 검증 재실행 예시(저장소 루트, BPF 사용이 허용된 로컬 Linux/WSL 환경):
+
+```sh
+go build -race -o /tmp/gobetween-review .
+GOBETWEEN_TEST_BINARY=/tmp/gobetween-review go test -race -count=1 ./test \
+  -run '^(TestUDPWorkerIntegration|TestUDPShutdownUnderTraffic)$' -v
+```
+
+physical 4-worker 시험에는 완전한 SMT 형제 그룹을 포함한 물리 코어 4개 이상이 필요하다.
+검증은 로컬 기능·종료 안정성 확인이며 상용 OpenShift 배포나 처리량/손실률 측정은 아니다.
+이 작업에서 상용 클러스터 변경, 이미지 push, Git commit은 수행하지 않았다.

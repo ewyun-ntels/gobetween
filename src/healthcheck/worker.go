@@ -117,7 +117,10 @@ func (this *Worker) process(checkResult CheckResult) {
 		this.LastResult = checkResult
 
 		log.Info("Sending to scheduler: ", this.LastResult)
-		this.out <- checkResult
+		select {
+		case this.out <- checkResult:
+		case <-this.stop:
+		}
 	}
 }
 

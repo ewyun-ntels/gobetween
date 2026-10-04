@@ -64,6 +64,8 @@ type Session struct {
 	out     chan packet
 	stopC   chan struct{}
 	stopped uint32
+	closeMu sync.Mutex
+	workers sync.WaitGroup
 
 	//scheduler
 	scheduler *scheduler.Scheduler
@@ -79,10 +81,12 @@ func NewSession(clientAddr *net.UDPAddr, conn net.Conn, backend core.Backend, sc
 		backend:    backend,
 		scheduler:  scheduler,
 		out:        make(chan packet, MAX_PACKETS_QUEUE),
-		stopC:      make(chan struct{}, 1),
+		stopC:      make(chan struct{}),
 	}
 
+	s.workers.Add(1)
 	go func() {
+		defer s.workers.Done()
 
 		var t *time.Timer
 		var tC <-chan time.Time
@@ -100,7 +104,10 @@ func NewSession(clientAddr *net.UDPAddr, conn net.Conn, backend core.Backend, sc
 			case pkt := <-s.out:
 				if t != nil {
 					if !t.Stop() {
-						<-t.C
+						select {
+						case <-t.C:
+						default:
+						}
 					}
 					t.Reset(cfg.ClientIdleTimeout)
 				}
@@ -154,6 +161,8 @@ func NewSession(clientAddr *net.UDPAddr, conn net.Conn, backend core.Backend, sc
 }
 
 func (s *Session) Write(buf []byte) error {
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
 	if atomic.LoadUint32(&s.stopped) == 1 {
 		return fmt.Errorf("Closed session")
 	}
@@ -176,8 +185,9 @@ func (s *Session) Write(buf []byte) error {
  * packet it receives
  */
 func (s *Session) ListenResponses(sendTo *net.UDPConn) {
-
+	s.workers.Add(1)
 	go func() {
+		defer s.workers.Done()
 		b := make([]byte, UDP_PACKET_SIZE)
 
 		defer s.Close()
@@ -226,8 +236,18 @@ func (s *Session) IsDone() bool {
 }
 
 func (s *Session) Close() {
-	select {
-	case s.stopC <- struct{}{}:
-	default:
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+	if atomic.SwapUint32(&s.stopped, 1) == 0 {
+		// Close the socket here to interrupt both blocked reads and writes.
+		// Serialize with Write so no packet is queued after the final drain.
+		s.conn.Close()
+		close(s.stopC)
 	}
+}
+
+// Wait joins the writer and response reader. Call only after ListenResponses
+// has been started (if used), and never from either of these goroutines.
+func (s *Session) Wait() {
+	s.workers.Wait()
 }

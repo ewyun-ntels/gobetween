@@ -84,16 +84,20 @@ func srvFetch(cfg config.DiscoveryConfig) (*[]core.Backend, error) {
 		if _, ok := hosts[record.Target]; !ok {
 			log.Debug("Fetching ", cfg.SrvLookupServer, " A/AAAA ", record.Target)
 
-			ip, err := srvIPLookup(cfg, record.Target, dns.TypeA)
-			if err != nil {
-				log.Warn("Error fetching A record for ", record.Target, ": ", err)
+			ip, aErr := srvIPLookup(cfg, record.Target, dns.TypeA)
+			if aErr != nil {
+				log.Warn("Error fetching A record for ", record.Target, ": ", aErr)
 			}
 
+			var aaaaErr error
 			if ip == "" {
-				ip, err = srvIPLookup(cfg, record.Target, dns.TypeAAAA)
-				if err != nil {
-					log.Warn("Error fetching AAAA record for ", record.Target, ": ", err)
+				ip, aaaaErr = srvIPLookup(cfg, record.Target, dns.TypeAAAA)
+				if aaaaErr != nil {
+					log.Warn("Error fetching AAAA record for ", record.Target, ": ", aaaaErr)
 				}
+			}
+			if ip == "" && (aErr != nil || aaaaErr != nil) {
+				return nil, fmt.Errorf("resolve SRV target %s: %w", record.Target, errors.Join(aErr, aaaaErr))
 			}
 
 			if ip != "" {
@@ -159,6 +163,12 @@ func srvDnsLookup(cfg config.DiscoveryConfig, pattern string, typ uint16) (*dns.
 				lastErr = exchangeErr
 				continue
 			}
+		}
+		// NXDOMAIN is a valid empty discovery, not a resolver failure.
+		// SERVFAIL/REFUSED must reach failpolicy (or the next nameserver).
+		if response.Rcode != dns.RcodeSuccess && response.Rcode != dns.RcodeNameError {
+			lastErr = fmt.Errorf("DNS server %s returned %s (%d) for %s", server, dns.RcodeToString[response.Rcode], response.Rcode, pattern)
+			continue
 		}
 		return response, nil
 	}

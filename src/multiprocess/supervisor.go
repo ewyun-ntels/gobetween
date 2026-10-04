@@ -34,6 +34,7 @@ type workerSlot struct {
 	command       *exec.Cmd
 	channel       *Channel
 	ready         bool
+	disconnected  bool
 	startedAt     time.Time
 	lastHeartbeat time.Time
 	snapshot      map[string]stats.Stats
@@ -251,6 +252,7 @@ func startWorker(slot *workerSlot, events chan<- workerEvent) error {
 	slot.command = command
 	slot.channel = channel
 	slot.ready = false
+	slot.disconnected = false
 	slot.startedAt = time.Now()
 	slot.lastHeartbeat = time.Time{}
 	slot.snapshot = nil
@@ -288,6 +290,11 @@ func handleWorkerEvent(event workerEvent, slots []*workerSlot, events chan<- wor
 
 	switch event.kind {
 	case eventMessage:
+		// Wait and the IPC reader run independently: buffered messages can
+		// arrive after exit, even though their generation still matches.
+		if slot.disconnected {
+			return nil
+		}
 		switch event.message.Type {
 		case messageReady:
 			if slot.ready {
@@ -313,6 +320,7 @@ func handleWorkerEvent(event workerEvent, slots []*workerSlot, events chan<- wor
 			supervisorLog.Errorf("Worker %d error: %s", slot.id, event.message.Error)
 		}
 	case eventReadEnd:
+		slot.disconnected = true
 		if slot.dispatch != nil {
 			if err := slot.dispatch.Remove(slot.id); err != nil {
 				return err
@@ -323,6 +331,7 @@ func handleWorkerEvent(event workerEvent, slots []*workerSlot, events chan<- wor
 		// Wait owns lifecycle and restart decisions; the socket normally closes
 		// just before the process exit notification arrives.
 	case eventExit:
+		slot.disconnected = true
 		if slot.dispatch != nil {
 			if err := slot.dispatch.Remove(slot.id); err != nil {
 				return err

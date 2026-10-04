@@ -7,6 +7,7 @@ package counters
  */
 
 import (
+	"sync"
 	"time"
 
 	"github.com/yyyar/gobetween/core"
@@ -37,7 +38,9 @@ type BackendsBandwidthCounter struct {
 	Out chan BandwidthStats
 
 	/* Stop channel */
-	stop chan bool
+	stop     chan struct{}
+	done     chan struct{}
+	stopOnce sync.Once
 }
 
 /**
@@ -49,7 +52,8 @@ func NewBackendsBandwidthCounter() *BackendsBandwidthCounter {
 		In:       make(chan []core.Target),
 		Traffic:  make(chan core.ReadWriteCount),
 		Out:      make(chan BandwidthStats),
-		stop:     make(chan bool),
+		stop:     make(chan struct{}),
+		done:     make(chan struct{}),
 	}
 }
 
@@ -59,22 +63,19 @@ func NewBackendsBandwidthCounter() *BackendsBandwidthCounter {
 func (this *BackendsBandwidthCounter) Start() {
 
 	go func() {
+		defer close(this.done)
+		defer func() {
+			for _, counter := range this.counters {
+				counter.Stop()
+			}
+			this.counters = nil
+		}()
 		for {
 			select {
 
 			// stop
 			case <-this.stop:
 
-				// Stop all counters
-				for i := range this.counters {
-					this.counters[i].Stop()
-				}
-				this.counters = nil
-
-				// close channels
-				close(this.In)
-				close(this.Traffic)
-				close(this.Out)
 				return
 
 			// new backends available
@@ -87,7 +88,11 @@ func (this *BackendsBandwidthCounter) Start() {
 				counter, ok := this.counters[rwc.Target]
 				// ignore stats for backend that is not is list
 				if ok {
-					counter.Traffic <- rwc
+					select {
+					case counter.Traffic <- rwc:
+					case <-this.stop:
+						return
+					}
 				}
 			}
 
@@ -136,5 +141,6 @@ func (this *BackendsBandwidthCounter) UpdateCounters(targets []core.Target) {
  * Stop backends counter
  */
 func (this *BackendsBandwidthCounter) Stop() {
-	this.stop <- true
+	this.stopOnce.Do(func() { close(this.stop) })
+	<-this.done
 }

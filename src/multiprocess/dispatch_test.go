@@ -8,6 +8,7 @@ import (
 
 	"github.com/yyyar/gobetween/config"
 	"github.com/yyyar/gobetween/metrics"
+	"github.com/yyyar/gobetween/stats"
 	"github.com/yyyar/gobetween/udpdispatch"
 )
 
@@ -84,5 +85,32 @@ func TestPartialStartupShutdown(t *testing.T) {
 	shutdownWorkerSet([]*workerSlot{{id: 1, dispatch: dispatch}, nil}, make(chan workerEvent), time.Second)
 	if len(dispatch.removed) != 1 {
 		t.Fatal("partial startup did not clean RR sockets")
+	}
+}
+
+func TestDispatchIgnoresMessagesAfterDisconnect(t *testing.T) {
+	metrics.Start(config.MetricsConfig{})
+	for _, terminal := range []string{eventExit, eventReadEnd} {
+		t.Run(terminal, func(t *testing.T) {
+			dispatch := &fakeDispatch{}
+			slot := &workerSlot{id: 1, generation: 1, dispatch: dispatch}
+			slots := []*workerSlot{slot}
+			events := make(chan workerEvent, 4)
+			if err := handleWorkerEvent(workerEvent{workerID: 1, generation: 1, kind: terminal}, slots, events, false, time.Second); err != nil {
+				t.Fatal(err)
+			}
+			dispatch.failure = errors.New("no pending listener after removal")
+			for _, kind := range []string{messageReady, messageHeartbeat, messageStats} {
+				err := handleWorkerEvent(workerEvent{workerID: 1, generation: 1, kind: eventMessage, message: Message{
+					Type: kind, Stats: map[string]stats.Stats{"proxy": {TxTotal: 100}},
+				}}, slots, events, false, time.Second)
+				if err != nil {
+					t.Fatalf("late %s must not abort supervisor: %v", kind, err)
+				}
+			}
+			if slot.ready || len(dispatch.ready) != 0 || slot.snapshot != nil || !slot.lastHeartbeat.IsZero() {
+				t.Fatal("late IPC message revived disconnected worker")
+			}
+		})
 	}
 }
